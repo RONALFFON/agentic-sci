@@ -11,7 +11,7 @@
     "openapi:types": "openapi-typescript ./openapi.json -o ./src/types/openapi.ts",
     "openapi:gen": "npm run openapi:export && npm run openapi:types",
     "openapi:gen:live": "npm run openapi:export:live && npm run openapi:types",
-    "postinstall": "rm -rf public/pdfjs && mkdir -p public/pdfjs && cp -r node_modules/pdfjs-dist/build public/pdfjs/build && cp -r node_modules/pdfjs-dist/web public/pdfjs/web"
+    "postinstall": "node -e \"const fs=require('fs'); fs.rmSync('public/pdfjs',{recursive:true,force:true}); fs.mkdirSync('public/pdfjs',{recursive:true}); fs.cpSync('node_modules/pdfjs-dist/build','public/pdfjs/build',{recursive:true}); fs.cpSync('node_modules/pdfjs-dist/web','public/pdfjs/web',{recursive:true});\""
   },
   "dependencies": {
     "@ant-design/icons-vue": "^7.0.1",
