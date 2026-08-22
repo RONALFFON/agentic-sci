@@ -23,6 +23,8 @@ def build_library_graph(
     include_keywords: bool,
     relation_edge_limit: int,
     focus_paper_id: int | None,
+    relation_types: set[str] | None = None,
+    min_score: float = 0.0,
 ) -> LibraryGraphResponse:
     try:
         ensure_tables(db.db_path)
@@ -62,6 +64,11 @@ def build_library_graph(
                 return
             edges[k] = e
 
+        def edge_allowed(edge_type: str, weight: float = 0.0) -> bool:
+            if float(weight or 0.0) < float(min_score or 0.0):
+                return False
+            return relation_types is None or edge_type in relation_types
+
         for p in papers:
             pid = int(getattr(p, "id") or 0)
             if pid <= 0:
@@ -85,7 +92,8 @@ def build_library_graph(
                     aid = graph_author_node_id(pid, idx, a)
                     alabel = graph_author_label(a, idx, aid)
                     up_node(GraphNode(id=aid, type="author", label=alabel, weight=1.0))
-                    up_edge(GraphEdge(source=aid, target=paper_node_id, type="authored_by", weight=1.0))
+                    if edge_allowed("authored_by", 1.0):
+                        up_edge(GraphEdge(source=aid, target=paper_node_id, type="authored_by", weight=1.0))
 
             kws: list[str] = []
             if include_keywords:
@@ -96,7 +104,8 @@ def build_library_graph(
                     kws.append(k)
                     kid = f"kw:{k.lower()}"
                     up_node(GraphNode(id=kid, type="keyword", label=k, weight=1.0))
-                    up_edge(GraphEdge(source=kid, target=paper_node_id, type="has_keyword", weight=1.0))
+                    if edge_allowed("has_keyword", 1.0):
+                        up_edge(GraphEdge(source=kid, target=paper_node_id, type="has_keyword", weight=1.0))
 
             if include_keywords and len(kws) > 1:
                 base = [f"kw:{k.lower()}" for k in kws[:12]]
@@ -107,12 +116,16 @@ def build_library_graph(
                             continue
                         if s > t:
                             s, t = t, s
-                        up_edge(GraphEdge(source=s, target=t, type="co_keyword", weight=0.5))
+                        if edge_allowed("co_keyword", 0.5):
+                            up_edge(GraphEdge(source=s, target=t, type="co_keyword", weight=0.5))
 
         try:
             rel_rows: list[tuple[int, int, str, float, str]] = []
             if focus_id is not None:
-                rel_rows = repo.fetch_relation_rows(focus_id=int(focus_id), paper_ids=None, limit=int(relation_edge_limit))
+                rel_rows = repo.fetch_relation_rows(
+                    focus_id=int(focus_id), paper_ids=None, limit=int(relation_edge_limit),
+                    relation_types=_db_relation_types(relation_types), min_score=float(min_score),
+                )
                 rel_paper_ids: set[int] = {int(focus_id)}
                 for sid, tid, _, _, _ in rel_rows:
                     rel_paper_ids.add(int(sid))
@@ -130,6 +143,7 @@ def build_library_graph(
             else:
                 rel_rows = repo.fetch_relation_rows(
                     focus_id=None, paper_ids=paper_ids_in_view, limit=int(relation_edge_limit),
+                    relation_types=_db_relation_types(relation_types), min_score=float(min_score),
                 )
 
             for sid, tid, rel, score, evidence in rel_rows:
@@ -137,15 +151,22 @@ def build_library_graph(
                 t = f"paper:{int(tid)}"
                 if s not in nodes or t not in nodes:
                     continue
-                up_edge(GraphEdge(
-                    source=s, target=t,
-                    type=f"paper_{str(rel or 'related')}",
-                    weight=float(score or 0.6),
-                    evidence=(str(evidence or "").strip()[:240] or None),
-                ))
-
-                rev = f"rev_{rel}" if rel else "related_to"
-                up_edge(GraphEdge(source=t, target=s, type=f"paper_{rev}", weight=float(score or 0.6) * 0.8))
+                raw_rel = str(rel or "related")
+                paper_rel = f"paper_{raw_rel}"
+                rev = f"rev_{raw_rel}" if raw_rel else "related_to"
+                paper_rev_rel = f"paper_{rev}"
+                score_value = float(score or 0.6)
+                evidence_value = str(evidence or "").strip()[:240] or None
+                if _paper_relation_direction_allowed(relation_types, raw_rel, reverse=False):
+                    up_edge(GraphEdge(
+                        source=s, target=t, type=paper_rel,
+                        weight=score_value, evidence=evidence_value,
+                    ))
+                if _paper_relation_direction_allowed(relation_types, raw_rel, reverse=True):
+                    up_edge(GraphEdge(
+                        source=t, target=s, type=paper_rev_rel,
+                        weight=score_value * 0.8, evidence=evidence_value,
+                    ))
         except Exception:
             logger.warning("graph_service: paper-paper relation fetch failed", exc_info=True)
 
@@ -167,18 +188,50 @@ def build_library_graph(
                     for j in range(i + 1, len(pids)):
                         shared = paper_au[pids[i]] & paper_au[pids[j]]
                         if shared:
-                            up_edge(GraphEdge(source=f"paper:{pids[i]}", target=f"paper:{pids[j]}",
-                                             type="shared_author", weight=min(2.0, len(shared) * 0.6)))
+                            weight = min(2.0, len(shared) * 0.6)
+                            if edge_allowed("shared_author", weight):
+                                up_edge(GraphEdge(source=f"paper:{pids[i]}", target=f"paper:{pids[j]}",
+                                                 type="shared_author", weight=weight))
             if include_keywords:
                 pids = list(paper_kw.keys())
                 for i in range(len(pids)):
                     for j in range(i + 1, len(pids)):
                         shared = paper_kw[pids[i]] & paper_kw[pids[j]]
                         if shared:
-                            up_edge(GraphEdge(source=f"paper:{pids[i]}", target=f"paper:{pids[j]}",
-                                             type="shared_keyword", weight=min(2.0, len(shared) * 0.35)))
+                            weight = min(2.0, len(shared) * 0.35)
+                            if edge_allowed("shared_keyword", weight):
+                                up_edge(GraphEdge(source=f"paper:{pids[i]}", target=f"paper:{pids[j]}",
+                                                 type="shared_keyword", weight=weight))
 
         return LibraryGraphResponse(success=True, nodes=list(nodes.values()), edges=list(edges.values()))
     except Exception as e:
         logger.exception("graph_service.build_library_graph_failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+def _db_relation_types(relation_types: set[str] | None) -> set[str] | None:
+    if relation_types is None:
+        return None
+    raw: set[str] = set()
+    for value in relation_types:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text.startswith("paper_rev_"):
+            raw.add(text[len("paper_rev_"):])
+        elif text.startswith("paper_"):
+            raw.add(text[len("paper_"):])
+        elif text not in {"authored_by", "has_keyword", "co_keyword", "shared_author", "shared_keyword"}:
+            raw.add(text)
+    return raw
+
+def _paper_relation_direction_allowed(
+    relation_types: set[str] | None,
+    raw_relation: str,
+    *,
+    reverse: bool,
+) -> bool:
+    if relation_types is None:
+        return True
+    raw = str(raw_relation or "related")
+    wanted = f"paper_rev_{raw}" if reverse else f"paper_{raw}"
+    return raw in relation_types or wanted in relation_types

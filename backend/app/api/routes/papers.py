@@ -1,10 +1,14 @@
 """论文库管理 API 路由 —— 论文保存、删除、搜索、分类与阅读状态管理."""
 
+import csv
+import io
+import json
 import logging
 
 
 import anyio
 from fastapi import APIRouter, Query, BackgroundTasks, Request, Depends, HTTPException
+from fastapi.responses import Response
 from ...utils.common import safe_http_500
 from ...models.schemas import (
     DeletePaperResponse,
@@ -24,6 +28,8 @@ from ...models.schemas import (
     ReadingCalendarItem,
     ReadingLogRequest,
     ReadingCalendarResponse,
+    GraphRelationUpsertRequest,
+    GraphRelationMutationResponse,
 )
 
 from ...services.papers.papers_converters import api_paper_to_litpaper, litpaper_to_api_paper
@@ -32,6 +38,7 @@ from ...services.papers.papers_helpers import (
     daily_paper_identity_sig,
 )
 from ...services.graph.graph_service import build_library_graph
+from ...services.graph.kg_relations import delete_relation, ensure_tables, upsert_relations
 from ...services.papers.papers_library_service import (
     build_library_pdf_response_service,
     delete_paper_by_id,
@@ -54,6 +61,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/papers", tags=["文献管理"])
 
+def _parse_relation_types(value: str | None) -> set[str] | None:
+    if value is None:
+        return None
+    parsed = {part.strip() for part in str(value).split(",") if part.strip()}
+    return parsed or None
+
 class DailyServices:
     def __init__(self, db_path=Depends(get_db_path), searcher=Depends(get_searcher)):
         self.db_path = db_path
@@ -68,6 +81,8 @@ def library_graph(
     include_keywords: bool = Query(default=False),
     relation_edge_limit: int = Query(default=400, ge=0, le=5000),
     focus_paper_id: int | None = Query(default=None, ge=1),
+    relation_types: str | None = Query(default=None, description="逗号分隔的关系类型"),
+    min_score: float = Query(default=0.0, ge=0.0, le=1.0),
     db=Depends(get_database),
 ):
     try:
@@ -79,10 +94,121 @@ def library_graph(
             include_keywords=bool(include_keywords),
             relation_edge_limit=int(relation_edge_limit),
             focus_paper_id=focus_paper_id,
+            relation_types=_parse_relation_types(relation_types),
+            min_score=float(min_score),
         )
     except Exception as e:
         logger.exception("GET /api/papers/graph/library 失败")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/graph/library/export")
+def export_library_graph(
+    format: str = Query(default="json", pattern="^(json|csv)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    category: str | None = Query(default=None),
+    include_authors: bool = Query(default=True),
+    include_keywords: bool = Query(default=True),
+    relation_edge_limit: int = Query(default=400, ge=0, le=5000),
+    focus_paper_id: int | None = Query(default=None, ge=1),
+    relation_types: str | None = Query(default=None, description="逗号分隔的关系类型"),
+    min_score: float = Query(default=0.0, ge=0.0, le=1.0),
+    db=Depends(get_database),
+):
+    graph = build_library_graph(
+        db=db,
+        limit=int(limit),
+        category=category,
+        include_authors=bool(include_authors),
+        include_keywords=bool(include_keywords),
+        relation_edge_limit=int(relation_edge_limit),
+        focus_paper_id=focus_paper_id,
+        relation_types=_parse_relation_types(relation_types),
+        min_score=float(min_score),
+    )
+    if format == "json":
+        content = json.dumps(graph.model_dump(mode="json"), ensure_ascii=False, indent=2)
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=papergraph.json"},
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "record_type", "id", "source", "target", "type", "label", "node_type",
+        "paper_id", "year", "category", "weight", "evidence",
+    ])
+    for node in graph.nodes:
+        writer.writerow([
+            "node", node.id, "", "", "", node.label, node.type,
+            node.paper_id or "", node.year or "", node.category or "", node.weight, "",
+        ])
+    for edge in graph.edges:
+        writer.writerow([
+            "edge", "", edge.source, edge.target, edge.type, "", "",
+            "", "", "", edge.weight, edge.evidence or "",
+        ])
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=papergraph.csv"},
+    )
+
+@router.put("/graph/relations", response_model=GraphRelationMutationResponse)
+def upsert_graph_relation(
+    body: GraphRelationUpsertRequest,
+    db=Depends(get_database),
+    db_path=Depends(get_db_path),
+):
+    source_id = int(body.source_paper_id)
+    target_id = int(body.target_paper_id)
+    if source_id == target_id:
+        raise HTTPException(status_code=422, detail="source_paper_id 与 target_paper_id 不能相同")
+    if not db.get_paper_by_id(source_id) or not db.get_paper_by_id(target_id):
+        raise HTTPException(status_code=404, detail="关系两端的论文不存在")
+
+    relation = body.relation.strip()
+    ensure_tables(db_path)
+    updated_fields = ["relation", "score", "evidence"]
+    previous = (body.previous_relation or "").strip()
+    if previous and previous != relation:
+        delete_relation(db_path, source_id, target_id, previous)
+        updated_fields.append("previous_relation")
+    written = upsert_relations(
+        db_path,
+        source_id,
+        [{"target_paper_id": target_id, "relation": relation, "score": body.score, "evidence": body.evidence or ""}],
+    )
+    if written != 1:
+        raise HTTPException(status_code=400, detail="关系保存失败")
+    return GraphRelationMutationResponse(
+        success=True,
+        message="知识图谱关系已保存",
+        source_paper_id=source_id,
+        target_paper_id=target_id,
+        relation=relation,
+        updated_fields=updated_fields,
+    )
+
+@router.delete("/graph/relations", response_model=GraphRelationMutationResponse)
+def remove_graph_relation(
+    source_paper_id: int = Query(..., ge=1),
+    target_paper_id: int = Query(..., ge=1),
+    relation: str = Query(..., min_length=2, max_length=32),
+    db_path=Depends(get_db_path),
+):
+    relation_name = relation.strip()
+    if not delete_relation(db_path, int(source_paper_id), int(target_paper_id), relation_name):
+        raise HTTPException(status_code=404, detail="知识图谱关系不存在")
+    return GraphRelationMutationResponse(
+        success=True,
+        message="知识图谱关系已删除",
+        source_paper_id=int(source_paper_id),
+        target_paper_id=int(target_paper_id),
+        relation=relation_name,
+        updated_fields=["deleted"],
+    )
 
 # ── 文献库管理 ──
 @router.get("/library/categories", response_model=LibraryCategoriesResponse)
