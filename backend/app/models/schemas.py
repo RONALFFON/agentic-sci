@@ -173,6 +173,20 @@ class LibraryGraphResponse(BaseAPIResponse):
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
 
+class GraphRelationUpsertRequest(BaseModel):
+    source_paper_id: int = Field(..., ge=1)
+    target_paper_id: int = Field(..., ge=1)
+    relation: str = Field(..., min_length=2, max_length=32)
+    score: float = Field(default=0.6, ge=0.0, le=1.0)
+    evidence: str | None = Field(default=None, max_length=240)
+    previous_relation: str | None = Field(default=None, min_length=2, max_length=32)
+
+class GraphRelationMutationResponse(BaseAPIResponse):
+    source_paper_id: int
+    target_paper_id: int
+    relation: str
+    updated_fields: list[str] = Field(default_factory=list)
+
 class PaperReaderOpeningRequest(BaseModel):
     paper_id: int = Field(..., ge=1)
 

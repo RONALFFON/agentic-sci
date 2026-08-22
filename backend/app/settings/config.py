@@ -25,6 +25,32 @@ _DEFAULT_DAILY_ARXIV_CS_CATEGORIES: tuple[str, ...] = (
     "cs.IR",
     "cs.HC",
 )
+
+
+def _normalize_bool_aliases() -> None:
+    """Accept common deployment labels such as ``DEBUG=release``.
+
+    Pydantic's boolean parser intentionally rejects these labels, but they are
+    frequently injected by process managers. Normalize only known aliases and
+    leave all other values unchanged so malformed configuration still fails
+    loudly during Settings construction.
+    """
+    aliases = {
+        "release": "false",
+        "prod": "false",
+        "production": "false",
+        "development": "true",
+        "dev": "true",
+        "debug": "true",
+    }
+    raw = (os.getenv("DEBUG") or "").strip().lower()
+    if raw in aliases:
+        os.environ["DEBUG"] = aliases[raw]
+
+
+_normalize_bool_aliases()
+
+
 class Settings(BaseSettings):
     """PaperGraph 全局配置，所有字段均可通过环境变量或 .env 文件覆盖."""
 
@@ -154,6 +180,23 @@ class Settings(BaseSettings):
         ge=1.0,
         le=12.0,
         description="原文→OpenAlex 会场探测墙钟上限（秒）",
+    )
+
+    papergraph_search_cache_enabled: bool = Field(
+        default=True,
+        description="是否启用搜索最终结果缓存",
+    )
+    papergraph_search_cache_ttl_sec: int = Field(
+        default=86400,
+        ge=0,
+        le=30 * 86400,
+        description="搜索结果缓存有效期（秒），0 表示关闭缓存",
+    )
+    papergraph_search_cache_max_entries: int = Field(
+        default=2000,
+        ge=50,
+        le=100000,
+        description="搜索结果缓存最大条目数",
     )
 
     papergraph_daily_auto_refresh: bool = Field(default=True)

@@ -15,6 +15,7 @@ type SearchAgentMessage = {
   results?: any[]
   total?: number
   isError?: boolean
+  metadata?: Record<string, unknown>
 }
 interface UseSearchAgentChatOptions {
   messages: Ref<SearchAgentMessage[]>
@@ -68,6 +69,22 @@ export function useSearchAgentChat({
           msg.isError = false
           return
         }
+        if (ev.type === 'stage') {
+          msg.metadata = {
+            ...(msg.metadata || {}),
+            request_id: ev.request_id || msg.metadata?.request_id,
+            last_stage: ev.stage,
+            last_stage_status: ev.status,
+            ...(Object.fromEntries(
+              Object.entries(ev).filter(([key]) => !['type', 'ts_ms', 'message', 'stage', 'status'].includes(key)),
+            )),
+          }
+          if (ev.status === 'running' && ev.message) {
+            msg.content = ev.message
+            msg.isError = false
+          }
+          return
+        }
         if (ev.type === 'error' && ev.message) {
           msg.content = `抱歉，搜索出现了问题：${ev.message}`
           msg.isError = true
@@ -84,6 +101,7 @@ export function useSearchAgentChat({
         msg.toolCalls = data.tool_calls
         msg.results = data.papers
         msg.total = data.total || data.papers?.length || 0
+        msg.metadata = data.metadata
         msg.isError = false
         msg.timestamp = Date.now()
       } else {

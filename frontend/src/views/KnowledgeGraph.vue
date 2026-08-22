@@ -14,6 +14,27 @@
           <a-select-option value="author">作者</a-select-option>
           <a-select-option value="keyword">关键词</a-select-option>
         </a-select>
+        <a-select
+          v-model:value="relationTypes"
+          mode="multiple"
+          allow-clear
+          :max-tag-count="1"
+          style="min-width: 220px; max-width: 320px"
+          placeholder="关系类型"
+        >
+          <a-select-option v-for="t in relationTypeOptions" :key="t" :value="t">
+            {{ edgeTypeLabel(t) }}
+          </a-select-option>
+        </a-select>
+        <a-input-number
+          v-model:value="minEdgeWeight"
+          :min="0"
+          :max="1"
+          :step="0.1"
+          :precision="2"
+          placeholder="最小权重"
+          style="width: 118px"
+        />
         <a-slider
           v-if="yearExtent[0] < yearExtent[1]"
           range
@@ -23,6 +44,10 @@
           :tip-formatter="(v: number) => String(v)"
           style="width: 200px; margin: 0 8px;"
         />
+      </a-space>
+      <a-space>
+        <a-button size="small" @click="exportGraph('json')">导出 JSON</a-button>
+        <a-button size="small" @click="exportGraph('csv')">导出 CSV</a-button>
       </a-space>
       <div class="kg-meta">
         <a-tag color="blue">nodes {{ filteredNodes.length }}</a-tag>
@@ -75,6 +100,36 @@
             >
               打开 target 阅读页
             </a-button>
+            <div
+              v-if="selectedEdge.sourcePaperId && selectedEdge.targetPaperId && !selectedEdge.type.startsWith('paper_rev_')"
+              class="kg-relation-editor"
+            >
+              <div class="kg-info__kv"><strong>编辑关系</strong></div>
+              <a-input v-model:value="edgeEdit.relation" placeholder="关系类型，如 cites" />
+              <a-input-number
+                v-model:value="edgeEdit.score"
+                :min="0"
+                :max="1"
+                :step="0.05"
+                :precision="2"
+                style="width: 100%; margin-top: 6px"
+              />
+              <a-textarea
+                v-model:value="edgeEdit.evidence"
+                :rows="3"
+                :maxlength="240"
+                show-count
+                placeholder="关系证据（可选）"
+                style="margin-top: 6px"
+              />
+              <a-space style="margin-top: 8px">
+                <a-button type="primary" size="small" :loading="relationSaving" @click="saveSelectedEdge">保存关系</a-button>
+                <a-button danger size="small" :loading="relationSaving" @click="deleteSelectedEdge">删除关系</a-button>
+              </a-space>
+            </div>
+            <div v-else-if="selectedEdge.type.startsWith('paper_rev_')" class="kg-relation-hint">
+              这是关系的反向展示边，请选中正向边后编辑。
+            </div>
           </div>
           <div v-else class="kg-info">
             <div class="kg-info__title">{{ selected!.label }}</div>
@@ -131,6 +186,8 @@ const rawNodes = ref<GraphNode[]>([])
 const rawEdges = ref<GraphEdge[]>([])
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<SelectedEdge | null>(null)
+const edgeEdit = ref({ relation: '', score: 0.6, evidence: '' })
+const relationSaving = ref(false)
 const paperDetail = ref<any>(null)
 const paperDetailLoading = ref(false)
 const hoverTip = ref<{ visible: boolean; x: number; y: number; title: string; meta: string }>({
@@ -142,6 +199,8 @@ const hoverTip = ref<{ visible: boolean; x: number; y: number; title: string; me
 })
 const filterText = ref('')
 const nodeType = ref<string | undefined>(undefined)
+const relationTypes = ref<string[]>([])
+const minEdgeWeight = ref(0)
 const hideHoverTip = () => { hoverTip.value.visible = false }
 const moveHoverTip = (ev: any) => {
   if (!hoverTip.value.visible) return
@@ -166,8 +225,15 @@ const filteredNodes = computed(() => {
 const filteredNodeSet = computed(() => new Set(filteredNodes.value.map((n) => n.id)))
 const filteredEdges = computed(() => {
   const s = filteredNodeSet.value
-  return rawEdges.value.filter((e) => s.has(e.source) && s.has(e.target))
+  return rawEdges.value.filter((e) => {
+    if (!s.has(e.source) || !s.has(e.target)) return false
+    if (relationTypes.value.length > 0 && !relationTypes.value.includes(e.type)) return false
+    return Number(e.weight ?? 0) >= minEdgeWeight.value
+  })
 })
+const relationTypeOptions = computed(() =>
+  Array.from(new Set(rawEdges.value.map((edge) => edge.type).filter(Boolean))).sort(),
+)
 let cleanup: (() => void) | null = null
 const openPaper = (id: number) => {
   const href = router.resolve({ path: `/library/read/${id}`, query: { standalone: '1' } }).href
@@ -224,6 +290,80 @@ async function load() {
     loading.value = false
   }
 }
+async function exportGraph(format: 'json' | 'csv') {
+  try {
+    const params = {
+      format,
+      limit: 250,
+      include_authors: true,
+      include_keywords: true,
+      relation_edge_limit: 800,
+      relation_types: relationTypes.value.length ? relationTypes.value.join(',') : undefined,
+      min_score: minEdgeWeight.value,
+    }
+    const r = await apiClient.get('/api/papers/graph/library/export', {
+      params,
+      responseType: 'blob',
+    })
+    const blob = r.data instanceof Blob ? r.data : new Blob([r.data])
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `papergraph.${format}`
+    link.click()
+    URL.revokeObjectURL(url)
+    message.success(`已导出 ${format.toUpperCase()} 图谱`)
+  } catch (e: unknown) {
+    message.error((e as Error).message || '图谱导出失败')
+  }
+}
+async function saveSelectedEdge() {
+  const edge = selectedEdge.value
+  const relation = edgeEdit.value.relation.trim()
+  if (!edge?.sourcePaperId || !edge.targetPaperId || !relation) {
+    message.warning('请填写关系类型')
+    return
+  }
+  relationSaving.value = true
+  try {
+    const previous = edge.type.startsWith('paper_') ? edge.type.slice('paper_'.length) : edge.type
+    await apiClient.put('/api/papers/graph/relations', {
+      source_paper_id: edge.sourcePaperId,
+      target_paper_id: edge.targetPaperId,
+      relation,
+      previous_relation: previous,
+      score: Number(edgeEdit.value.score ?? 0.6),
+      evidence: edgeEdit.value.evidence.trim() || undefined,
+    })
+    message.success('关系已保存')
+    await load()
+  } catch (e: unknown) {
+    message.error((e as Error).message || '关系保存失败')
+  } finally {
+    relationSaving.value = false
+  }
+}
+async function deleteSelectedEdge() {
+  const edge = selectedEdge.value
+  if (!edge?.sourcePaperId || !edge.targetPaperId) return
+  const relation = edge.type.startsWith('paper_') ? edge.type.slice('paper_'.length) : edge.type
+  relationSaving.value = true
+  try {
+    await apiClient.delete('/api/papers/graph/relations', {
+      params: {
+        source_paper_id: edge.sourcePaperId,
+        target_paper_id: edge.targetPaperId,
+        relation,
+      },
+    })
+    message.success('关系已删除')
+    await load()
+  } catch (e: unknown) {
+    message.error((e as Error).message || '关系删除失败')
+  } finally {
+    relationSaving.value = false
+  }
+}
 async function expandPaper(paperId: number) {
   loading.value = true
   try {
@@ -261,6 +401,14 @@ watch(selected, (node) => {
       .finally(() => { paperDetailLoading.value = false })
   } else {
     paperDetailLoading.value = false
+  }
+})
+watch(selectedEdge, (edge) => {
+  if (!edge) return
+  edgeEdit.value = {
+    relation: edge.type.startsWith('paper_') ? edge.type.slice('paper_'.length) : edge.type,
+    score: Number(edge.weight ?? 0.6),
+    evidence: edge.evidence || '',
   }
 })
 function colorFor(t: string) {
@@ -431,9 +579,9 @@ function render() {
     sim.stop()
   }
 }
-watch([filterText, nodeType], () => {
+watch([filterText, nodeType, relationTypes, minEdgeWeight], () => {
   render()
-})
+}, { deep: true })
 onMounted(() => {
   load()
 })
@@ -488,6 +636,16 @@ onBeforeUnmount(() => {
 .kg-info__kv {
   margin: 4px 0;
   font-size: 13px;
+}
+.kg-relation-editor {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #f0f0f0;
+}
+.kg-relation-hint {
+  margin-top: 10px;
+  color: rgba(0,0,0,0.45);
+  font-size: 12px;
 }
 .kg-evidence {
   padding: 8px 10px;

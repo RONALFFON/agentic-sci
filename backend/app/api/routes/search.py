@@ -6,7 +6,8 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,7 @@ from ...models.schemas import Paper
 from ...services.papers.papers_converters import litpapers_to_api_papers
 from ...services.retrieval.search_plan import ResolvedSearchPlan
 from ...services.retrieval.search_pipeline import run_search_pipeline_async
+from ...services.retrieval.search_cache import SearchResultCache
 from ..tool_events import ToolCallTracker, sse_pack
 
 router = APIRouter(prefix="/papers", tags=["智能搜索"])
@@ -55,6 +57,7 @@ class SearchAgentResponse(BaseModel):
     papers: List[Paper] = Field(default_factory=list)
     total: int = 0
     message: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 def _search_params_from_intent(intent: SearchIntent, **extra: Any) -> Dict[str, Any]:
@@ -135,19 +138,93 @@ async def _run_search_agent_core(
     request: SearchAgentMessage,
     merged_query: str,
     searcher: Any,
+    stage_callback: Optional[Callable[[str, str, str, Dict[str, Any]], None]] = None,
 ) -> SearchAgentResponse:
     tool_calls: List[ToolCallInfo] = []
 
+    def emit_stage(stage: str, status: str, message: str, **details: Any) -> None:
+        if stage_callback is not None:
+            stage_callback(stage, status, message, details)
+
+    emit_stage("intent_parsing", "running", "正在解析检索意图")
     intent = agent.understand_intent(merged_query, request.mode)
     with track_tool_call(tool_calls, "understand_intent", {"query": merged_query}) as tc:
         tc.result_summary = f"sort={intent.sort}, venues={intent.venues}, yf={intent.year_from}, kw={intent.keywords}"
+    emit_stage(
+        "intent_parsing",
+        "completed",
+        "检索意图解析完成",
+        query=intent.query,
+        keyword_count=len(intent.keywords or []),
+        source_count=len(intent.sources or []),
+    )
 
     plan = ResolvedSearchPlan.from_search_intent(intent)
+    cache = SearchResultCache()
+    cache_key = cache.key_for_plan(
+        plan,
+        mode=request.mode,
+        use_tavily=bool(request.use_tavily),
+    )
+    with track_tool_call(
+        tool_calls,
+        "search_cache",
+        {"key": cache_key[:12]},
+    ) as tc:
+        emit_stage("cache_lookup", "running", "正在检查搜索结果缓存", cache_key=cache_key[:12])
+        try:
+            cached_payload = cache.get(cache_key)
+            tc.result_summary = "命中缓存" if cached_payload else (
+                "未命中，继续执行检索" if cache.enabled and cache.ttl_sec > 0 else "缓存未启用"
+            )
+        except Exception as exc:
+            cached_payload = None
+            tc.status = "error"
+            tc.result_summary = f"缓存读取失败，已跳过: {str(exc)[:100]}"
+            logger.warning("search_result_cache_read_failed", exc_info=exc)
+    emit_stage(
+        "cache_lookup",
+        "completed",
+        "命中搜索结果缓存" if cached_payload else "未命中缓存，继续检索",
+        cache_hit=bool(cached_payload),
+        cache_key=cache_key[:12],
+        cache_enabled=bool(cache.enabled and cache.ttl_sec > 0),
+    )
+    if cached_payload:
+        try:
+            cached_response = SearchAgentResponse.model_validate(cached_payload)
+            cached_metadata = dict(cached_response.metadata or {})
+            cached_metadata.update({"cache_hit": True, "cache_key": cache_key[:12]})
+            emit_stage("search_pipeline", "skipped", "命中缓存，跳过召回与精排", cache_hit=True)
+            return cached_response.model_copy(
+                update={
+                    "tool_calls": normalize_tool_calls(tool_calls),
+                    "metadata": cached_metadata,
+                }
+            )
+        except Exception:
+            logger.warning("search_result_cache_payload_invalid", exc_info=True)
+            cached_payload = None
+            emit_stage("cache_lookup", "warning", "缓存内容无效，改为执行实时检索", cache_hit=False)
+
+    emit_stage("search_pipeline", "running", "正在执行多源召回与精排")
     with track_tool_call(tool_calls, "search_pipeline", {"query": intent.query or merged_query}) as tc:
         tc.result_summary = "intent→SearchPlan→pipeline"
         mr = int(getattr(plan, "max_results", None) or intent.max_results or 10)
         pip = await run_search_pipeline_async(searcher=searcher, plan=plan, max_results=mr)
-        tc.result_summary = f"ranked={len(pip.ranked or [])}"
+        tc.result_summary = (
+            f"candidates={pip.total_candidates}, ranked={len(pip.ranked or [])}, "
+            f"method={pip.ranking_method}"
+        )
+    emit_stage(
+        "search_pipeline",
+        "completed",
+        "多源召回与精排完成",
+        candidates=pip.total_candidates,
+        ranked=len(pip.ranked or []),
+        ranking_method=pip.ranking_method,
+        metadata=pip.metadata or {},
+    )
 
     papers = litpapers_to_api_papers(rp.paper for rp in (pip.ranked or []))
     prefix = f"为您找到 {len(papers)} 篇论文。" if papers else "未找到相关论文。"
@@ -167,39 +244,79 @@ async def _run_search_agent_core(
             papers=[],
             total=0,
             message="search_pipeline_error",
+            metadata={
+                **(pip.metadata or {}),
+                "cache_hit": False,
+                "cache_key": cache_key[:12],
+                "candidates": pip.total_candidates,
+                "ranked": len(pip.ranked or []),
+                "ranking_method": pip.ranking_method,
+            },
         )
 
     body = _explanation_with_suggestions(agent, intent, papers, request.mode, prefix_plain=prefix)
-    return SearchAgentResponse(
+    response = SearchAgentResponse(
         success=True,
         response=body,
         search_params=_search_params_from_intent(intent, mode=request.mode),
         tool_calls=normalize_tool_calls(tool_calls),
         papers=papers,
         total=len(papers),
+        metadata={
+            **(pip.metadata or {}),
+            "cache_hit": False,
+            "cache_key": cache_key[:12],
+            "candidates": pip.total_candidates,
+            "ranked": len(pip.ranked or []),
+            "ranking_method": pip.ranking_method,
+        },
     )
-
-
-async def _search_agent_impl(request: SearchAgentMessage, searcher: Any):
     try:
+        cache.set(
+            cache_key,
+            response.model_dump(mode="json", exclude={"tool_calls"}),
+            metadata=response.metadata,
+        )
+    except Exception as exc:
+        logger.warning("search_result_cache_write_failed", exc_info=exc)
+        emit_stage("cache_write", "warning", "搜索结果已返回，但缓存写入失败", cache_key=cache_key[:12])
+    return response
+
+
+async def _search_agent_impl(
+    request: SearchAgentMessage,
+    searcher: Any,
+    stage_callback: Optional[Callable[[str, str, str, Dict[str, Any]], None]] = None,
+):
+    def emit_stage(stage: str, status: str, message: str, **details: Any) -> None:
+        if stage_callback is not None:
+            stage_callback(stage, status, message, details)
+
+    try:
+        emit_stage("agent_init", "running", "正在初始化 SearchAgent")
         agent, merged_query = await _prepare_agent_and_query(request)
+        emit_stage("agent_init", "completed", "SearchAgent 初始化完成")
         resp = await asyncio.wait_for(
             _run_search_agent_core(
                 agent=agent,
                 request=request,
                 merged_query=merged_query,
                 searcher=searcher,
+                stage_callback=stage_callback,
             ),
             timeout=_SEARCH_AGENT_WALL_SEC,
         )
         return resp, None
     except asyncio.TimeoutError as exc:
         logger.warning("search-agent timeout after %.0fs", _SEARCH_AGENT_WALL_SEC, exc_info=exc)
+        emit_stage("request", "error", "搜索处理超时", error_code="search_agent_timeout")
         return _error_response("search_agent_timeout"), HTTPException(status_code=504, detail="search_agent_timeout")
     except HTTPException as e:
+        emit_stage("request", "error", user_facing_error_message(str(e.detail or "search_agent_http_error")), error_code=str(e.detail or "search_agent_http_error"))
         return _error_response(str(e.detail or "search_agent_http_error")), e
     except Exception:
         logger.exception("search-agent unexpected failure")
+        emit_stage("request", "error", "搜索服务内部错误", error_code="search_agent_internal_error")
         return _error_response("search_agent_internal_error"), None
 
 
@@ -208,17 +325,42 @@ async def search_agent_chat_stream(
     request: SearchAgentMessage,
     searcher=Depends(get_searcher),
 ):
+    request_id = uuid4().hex[:16]
+
     async def gen():
         # SSE 流式生成器：通过 anyio 内存通道实现事件驱动的流式推送
         send, recv = anyio.create_memory_object_stream(_SSE_QUEUE_SIZE)
         tracker = ToolCallTracker(sink=lambda ev: send.send_nowait(ev))
-        tracker.emit("status", {"message": "search-agent 已接入，开始处理"})
+        def emit_stage(
+            stage: str,
+            status: str,
+            message: str,
+            details: Optional[Dict[str, Any]] = None,
+            **extra: Any,
+        ) -> None:
+            payload = dict(details or {})
+            payload.update(extra)
+            tracker.emit(
+                "stage",
+                {
+                    "request_id": request_id,
+                    "stage": stage,
+                    "status": status,
+                    "message": message,
+                    **payload,
+                },
+            )
+
+        tracker.emit("status", {"request_id": request_id, "message": "search-agent 已接入，开始处理"})
 
         async def run_once() -> SearchAgentResponse:
-            tracker.emit("status", {"message": f"初始化 SearchAgent（mode={request.mode})"})
+            tracker.emit(
+                "status",
+                {"request_id": request_id, "message": f"初始化 SearchAgent（mode={request.mode})"},
+            )
             t0 = time.time()
-            tracker.emit("status", {"message": "正在检索论文…"})
-            resp, exc = await _search_agent_impl(request, searcher)
+            tracker.emit("status", {"request_id": request_id, "message": "正在检索论文…"})
+            resp, exc = await _search_agent_impl(request, searcher, stage_callback=emit_stage)
             if exc:
                 code = (
                     str(exc.detail or "search_agent_http_error")
@@ -229,10 +371,26 @@ async def search_agent_chat_stream(
                 tracker.emit("error", {"message": msg})
                 if not isinstance(exc, HTTPException):
                     logger.exception("search-agent stream run loop failed")
-                return _error_response(msg)
+                failed = _error_response(msg)
+                return failed.model_copy(
+                    update={"metadata": {"request_id": request_id, "elapsed_ms": int((time.time() - t0) * 1000)}}
+                )
+            elapsed_ms = int((time.time() - t0) * 1000)
+            metadata = dict(resp.metadata or {})
+            metadata.update({"request_id": request_id, "elapsed_ms": elapsed_ms})
+            resp = resp.model_copy(update={"metadata": metadata})
+            emit_stage(
+                "request",
+                "completed",
+                "搜索请求处理完成",
+                success=bool(resp.success),
+                total=resp.total,
+                cache_hit=metadata.get("cache_hit"),
+                elapsed_ms=elapsed_ms,
+            )
             tracker.emit(
                 "final",
-                {"elapsed_ms": int((time.time() - t0) * 1000), "success": bool(resp.success)},
+                {"request_id": request_id, "elapsed_ms": elapsed_ms, "success": bool(resp.success)},
             )
             return resp
 
@@ -270,7 +428,11 @@ async def search_agent_chat_stream(
         resp: Optional[SearchAgentResponse] = box.get("resp")
         if resp is None:
             resp = _error_response("search_agent_stream_incomplete")
-            tracker.emit("error", {"message": resp.message or "search_agent_stream_incomplete"})
+            resp = resp.model_copy(update={"metadata": {"request_id": request_id}})
+            tracker.emit(
+                "error",
+                {"request_id": request_id, "message": resp.message or "search_agent_stream_incomplete"},
+            )
         yield sse_pack({"type": "final_result", "result": resp.model_dump(mode="json")})
 
     return StreamingResponse(

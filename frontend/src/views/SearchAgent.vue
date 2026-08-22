@@ -68,6 +68,17 @@
               <div v-if="msg.searchParams" class="search-params">
                 <a-tag v-if="msg.searchParams.venue" size="small" color="purple">{{ msg.searchParams.venue }}</a-tag>
               </div>
+              <div v-if="msg.metadata" class="search-observability">
+                <span v-if="msg.metadata.cache_hit === true">缓存命中</span>
+                <span v-else-if="msg.metadata.cache_hit === false">实时检索</span>
+                <span v-if="typeof msg.metadata.candidates === 'number'">召回 {{ msg.metadata.candidates }}</span>
+                <span v-if="typeof msg.metadata.ranked === 'number'">精排 {{ msg.metadata.ranked }}</span>
+                <span v-if="msg.metadata.ranking_method">{{ msg.metadata.ranking_method }}</span>
+                <span v-if="typeof msg.metadata.elapsed_ms === 'number'">耗时 {{ msg.metadata.elapsed_ms }} ms</span>
+                <span v-if="msg.metadata.request_id" class="request-id" :title="String(msg.metadata.request_id)">
+                  请求 {{ String(msg.metadata.request_id).slice(0, 8) }}
+                </span>
+              </div>
               <SearchResultPapers
                 v-if="msg.results?.length"
                 :papers="msg.results"
@@ -190,6 +201,7 @@ interface Message {
   results?: Paper[]
   total?: number
   isError?: boolean
+  metadata?: Record<string, unknown>
 }
 const messages = ref<Message[]>([])
 const userInput = ref('')
@@ -675,6 +687,23 @@ watch(currentConversationId, () => scrollToBottom())
   gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 12px;
+}
+.search-observability {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -4px 0 12px;
+  color: #64748b;
+  font-size: 12px;
+}
+.search-observability > span {
+  padding: 2px 7px;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  background: #f8fafc;
+}
+.search-observability .request-id {
+  color: #94a3b8;
 }
 .chat-input-area {
   padding: 16px 20px 24px;

@@ -9,10 +9,11 @@ interface ToolCall {
   name: string; status: 'running' | 'success' | 'error'
   params?: Record<string, unknown>; result_summary?: string
 }
-interface SearchAgentResponse {
+export interface SearchAgentResponse {
   success: boolean; response: string; total: number
   search_params?: { query: string; keywords: string[]; venues: string[]; year_from?: number; year_to?: number; sort: string; mode: string }
   tool_calls?: ToolCall[]; papers?: Paper[]; message?: string
+  metadata?: Record<string, unknown>
 }
 const SEARCH_AGENT_REQUEST_MS = 420000
 
@@ -37,6 +38,7 @@ function streamHttpErrorMessage(status: number, bodyText: string): string {
 
 export type SearchAgentStreamEvent =
   | { type: 'status'; ts_ms?: number; message?: string }
+  | { type: 'stage'; ts_ms?: number; request_id?: string; stage?: string; status?: string; message?: string; [key: string]: unknown }
   | { type: 'tool_call'; ts_ms?: number; tool?: string; parameters?: any; result?: any }
   | { type: 'final'; ts_ms?: number; elapsed_ms?: number; success?: boolean }
   | { type: 'error'; ts_ms?: number; message?: string }

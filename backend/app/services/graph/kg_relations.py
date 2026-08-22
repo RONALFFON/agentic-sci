@@ -58,6 +58,7 @@ def ensure_tables(db_path: str) -> None:
         )""",
         "CREATE INDEX IF NOT EXISTS idx_paper_relations_source ON paper_relations(source_paper_id)",
         "CREATE INDEX IF NOT EXISTS idx_paper_relations_target ON paper_relations(target_paper_id)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_relations_relation ON paper_relations(relation)",
     )
 
 @suppress_exceptions(default_return=[])
@@ -291,6 +292,16 @@ def upsert_relations(db_path: str, source_paper_id: int, edges: list[dict[str, A
     conn.close()
     return n
 
+def delete_relation(db_path: str, source_paper_id: int, target_paper_id: int, relation: str) -> bool:
+    ensure_tables(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.execute(
+            """DELETE FROM paper_relations
+            WHERE source_paper_id = ? AND target_paper_id = ? AND relation = ?""",
+            (int(source_paper_id), int(target_paper_id), str(relation or "").strip()),
+        )
+        return cur.rowcount > 0
+
 def build_relations_for_new_paper(db_path: str, new_paper_id: int) -> int:
     from ...agents import get_knowledge_graph_agent
 
@@ -340,7 +351,7 @@ def build_relations_for_new_paper(db_path: str, new_paper_id: int) -> int:
                 db_path, int(new_paper_id), pdf_abspath, max_chars=9000
             )
             if not excerpt.strip():
-                excerpt = extract_pdf_text_full(pdf_abspath, max_chars=9000)
+                excerpt = extract_pdf_text_full(pdf_abspath)
                 if excerpt.strip():
                     _cache_set(db_path, int(new_paper_id), pdf_abspath, excerpt)
             if excerpt.strip():
