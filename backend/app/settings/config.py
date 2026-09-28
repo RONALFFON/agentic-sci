@@ -92,6 +92,33 @@ class Settings(BaseSettings):
         description="兼容 OpenAI 的 chat 模型 ID",
     )
 
+    # ── Embedding 配置（记忆层语义召回）──
+    embed_enabled: bool = Field(default=True, description="是否启用 embedding 语义召回；关闭或未配置密钥时退回关键词匹配")
+    embed_api_key: str = Field(default="", description="Embedding API key（OpenAI 兼容）")
+    embed_base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="Embedding 服务 base_url，需兼容 OpenAI /embeddings",
+    )
+    embed_model_name: str = Field(default="text-embedding-v4", description="Embedding 模型 ID")
+    embed_model_type: str = Field(default="dashscope", description="Embedding 提供方类型（信息用途）")
+    embed_dimensions: int = Field(default=1024, ge=1, le=4096, description="向量维度；需与模型支持一致")
+    embed_batch_size: int = Field(default=10, ge=1, le=64, description="单次 /embeddings 请求的最大文本条数")
+    embed_timeout_sec: float = Field(default=8.0, ge=1.0, le=60.0, description="Embedding 请求超时（秒）")
+
+    # ── 记忆层混合召回权重 ──
+    papergraph_memory_sem_weight: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=20.0,
+        description="记忆召回中语义相似度项权重",
+    )
+    papergraph_memory_kw_weight: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=20.0,
+        description="记忆召回中关键词重叠项权重",
+    )
+
     # ── 存储路径 ──
     data_dir: str = _DEFAULT_DATA_DIR
     downloads_dir: str = Field(
