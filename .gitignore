@@ -8,6 +8,9 @@ frontend/dist/
 frontend/.vite/
 *.local
 
+# ===== vendored 前端第三方库（迁 npm/CDN 前过渡，勿入库）=====
+frontend/public/pdfjs/
+
 # ===== Python =====
 __pycache__/
 **/__pycache__/
@@ -16,10 +19,17 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
+**/.pytest_cache/
+.benchmarks/
+**/.benchmarks/
 
 # ===== 运行时数据 / 用户数据 =====
 backend/data/*.db
 backend/data/*.db-journal
+backend/data/*.db-wal
+backend/data/*.db-shm
+backend/data/memory/
 backend/data/experiments/
 backend/downloads/papers/
 
@@ -35,7 +45,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# ===== IDE / 编辑器 =====
+# ===== IDE / 编辑器 / 工具 =====
 .idea/
 .vscode/
+.claude/
 *.swp
