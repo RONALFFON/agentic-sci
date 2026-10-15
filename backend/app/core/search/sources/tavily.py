@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.llm.agent_runtime import run_sync
+
 import asyncio
 import logging
 import re
@@ -49,7 +51,7 @@ async def _llm_filter_relevant(
         + "\n".join(titles)
     )
     try:
-        data = await asyncio.to_thread(
+        data = await run_sync(
             lambda: run_json_task(
                 task_name="paper_relevance_filter",
                 agent_name="papergraph_relevance_filter",
@@ -134,7 +136,7 @@ async def _llm_extract_papers_from_raw(
         f"页面文本：\n{cleaned}"
     )
     try:
-        data = await asyncio.to_thread(
+        data = await run_sync(
             lambda: run_json_task(
                 task_name="tavily_page_extract",
                 agent_name="papergraph_tavily_extractor",

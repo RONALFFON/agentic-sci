@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import copy
+import json
+from pathlib import Path
 import re
 import threading
 from dataclasses import dataclass
@@ -15,9 +18,12 @@ from app.core.paper_paths import normalize_library_category_display
 
 from ..utils import parse_llm_json
 from ..services.llm.agent_config import papergraph_agent_config
+from ..services.llm.agent_runtime import check_active, _run_with_optional_timeout, _task_failed_due_to_timeout
+from ..services.task_state import identity, file_version, task_lock
 from ..services.llm.llm_service import is_llm_configured, coerce_hello_agents_llm_output_to_str
 from .base import BaseAgent
 from .support.paper_analysis_helpers import (
+    build_reader_prompt,
     clip_text as _clip,
     clip_reader_history as _clip_reader_history,
     clean_library_tag as _clean_library_tag,
@@ -57,7 +63,7 @@ def _reader_resolve_user_hint(user_message: str, snap: Dict[str, Any], *, want_r
     return "\n".join(bits).strip()[:900] or um[:900]
 
 _MAJOR_LOCK = threading.Lock()
-_MAJOR_WHITELIST: Optional[Tuple[str, ...]] = None
+_MAJOR_WHITELISTS: dict[str, Tuple[str, ...]] = {}
 
 @dataclass
 class TaskSpec:
@@ -71,12 +77,11 @@ class PaperAnalysisAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        self._analysis = SimpleAgent(
-            name="papergraph_analysis",
-            llm=self.llm,
-            system_prompt=ANALYSIS_SYSTEM,
-            config=papergraph_agent_config(),
-        )
+    @property
+    def _analysis(self):
+        return SimpleAgent(name="papergraph_analysis", llm=self.llm, system_prompt=ANALYSIS_SYSTEM, config=papergraph_agent_config())
+
+    def _init_reader_execution(self) -> None:
         self._reader_lookup_lock = threading.Lock()
         self._reader_lookup_buffer: List[Tuple[Any, str]] = []
         self._reader_snap: Dict[str, Any] = {}
@@ -119,12 +124,21 @@ class PaperAnalysisAgent(BaseAgent):
         )
 
     def _ensure_major_whitelist(self) -> None:
-        global _MAJOR_WHITELIST
-        if _MAJOR_WHITELIST is not None:
+        root = str(Path(self._settings.data_dir).resolve())
+        taxonomy_path = Path(root) / "memory" / "taxonomy-v1.json"
+        if root in _MAJOR_WHITELISTS:
             return
         with _MAJOR_LOCK:
-            if _MAJOR_WHITELIST is not None:
+            if root in _MAJOR_WHITELISTS:
                 return
+            try:
+                if taxonomy_path.is_file():
+                    saved = _parse_taxonomy_majors(taxonomy_path.read_text(encoding="utf-8"))
+                    if saved:
+                        _MAJOR_WHITELISTS[root] = tuple(saved)
+                        return
+            except (OSError, ValueError):
+                logger.warning("major_taxonomy_cache_invalid")
             wl: Optional[Tuple[str, ...]] = None
             taxonomy_prompt = (
                 "# 任务：为个人/小团队文献库生成顶层大类\n"
@@ -134,39 +148,41 @@ class PaperAnalysisAgent(BaseAgent):
                 "- 每条 2～10 个中文字；互异；禁含「/」及路径非法字符\n"
             )
             try:
-                raw = self._analysis.run(taxonomy_prompt)
+                raw = _run_with_optional_timeout(lambda: self._analysis.run(taxonomy_prompt), 30)
                 parsed = _parse_taxonomy_majors(raw)
                 if not parsed:
-                    self._analysis.run(taxonomy_prompt + '\n请确保输出合法 JSON。')
+                    raw = _run_with_optional_timeout(lambda: self._analysis.run(taxonomy_prompt + '\n请确保输出合法 JSON。'), 30)
+                    parsed = _parse_taxonomy_majors(raw)
                 if parsed:
                     wl = tuple(parsed)
             except Exception:
                 logger.exception("major_taxonomy_bootstrap_failed")
             if not wl:
                 raise RuntimeError("major_taxonomy_bootstrap_failed")
-            _MAJOR_WHITELIST = wl
+            check_active()
+            taxonomy_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = taxonomy_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"majors": list(wl)}, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(taxonomy_path)
+            _MAJOR_WHITELISTS[root] = wl
             logger.info("paper_analysis_major_whitelist_ready", extra={"n": len(wl)})
 
     def _get_major_whitelist(self) -> Tuple[str, ...]:
         self._ensure_major_whitelist()
-        if _MAJOR_WHITELIST is None:
-            raise RuntimeError("major_whitelist_unavailable")
-        return _MAJOR_WHITELIST
+        return _MAJOR_WHITELISTS[str(Path(self._settings.data_dir).resolve())]
 
     def _cleanup_mixed_reader_response(self, reply: str, user_message: str) -> str:
         """Use one cleanup pass when tool output leaks into the final reply."""
         t = reply.strip()
-        # Typical leak: disclaimer plus useful data, or raw tool JSON.
-        has_disclaimer = any(x in t[:300] for x in ("材料不足", "缺少", "仅有标题")) or bool(re.search(r"基于.*推测", t[:300]))
-        has_actual_data = len(t) > 600 and any(x in t for x in ("Tab.", "Table", "结果", "实验", "| "))
+        # 只有工具包装泄漏才追加整理调用，正常的证据不足说明不触发。
         has_tool_artifact = "reader_pdf_struct" in t or '"chapters"' in t[:500]
 
-        if (has_disclaimer and has_actual_data) or has_tool_artifact:
+        if has_tool_artifact:
             if not is_llm_configured():
                 return reply
             logger.info("paper_reader: detected mixed response, running cleanup pass")
             try:
-                um = (user_message or "").strip()[:200]
+                um = (user_message or "").strip()
                 # Keep extracted paper facts; drop wrapper noise.
                 cleaned = re.sub(r"^.*?(?:当前文献材料说明|当前提供的材料).*?\n\n", "", t, flags=re.S)
                 cleaned = re.sub(r"reader_pdf_struct\S*", "", cleaned)
@@ -176,7 +192,7 @@ class PaperAnalysisAgent(BaseAgent):
                         f"用户问：{um}\n\n"
                         f"以下是从论文中提取的信息（可能含多个片段）：\n\n{cleaned}\n\n"
                         "请整合成一个连贯的回答。用中文分点说明。如有表格数据用 Markdown 表格呈现。"
-                        "不要提及'材料不足'或'推测'——只基于已有信息回答，不确定的地方标注'论文未提供'。"
+                        "保留原回答的证据边界和不确定性；只基于已有信息回答，缺失信息标注'论文未提供'。"
                     )
                     result = self._reader_chat_llm(prompt)
                     if result.strip():
@@ -193,10 +209,6 @@ class PaperAnalysisAgent(BaseAgent):
             return False
         if "reader_pdf_structure" in t:
             return True
-        if t.startswith("## ") and len(t) > 300:
-            first_line = t.split("\n")[0]
-            if re.match(r"^## \d", first_line) or re.match(r"^## [A-Z]", first_line):
-                return True
         if '"chapters"' in t[:500] or '"references"' in t[:500]:
             return True
         return False
@@ -206,7 +218,7 @@ class PaperAnalysisAgent(BaseAgent):
         if not is_llm_configured():
             return tool_output
         try:
-            um = (user_message or "").strip()[:200]
+            um = (user_message or "").strip()
             # Strip tool wrappers before asking the LLM to explain.
             cleaned = re.sub(r"^.*?reader_pdf_structure[：:]\s*", "", tool_output, flags=re.S)
             cleaned = re.sub(r"^以下为 JSON.*?\n", "", cleaned)
@@ -232,18 +244,9 @@ class PaperAnalysisAgent(BaseAgent):
             return tool_output
 
     def _reader_chat_llm(self, prompt: str) -> str:
-        """Reader chat without tools."""
-        from ..services.llm.llm_service import coerce_hello_agents_llm_output_to_str
-        if not hasattr(self, "_reader_interpreter"):
-            from hello_agents import SimpleAgent
-            self._reader_interpreter = SimpleAgent(
-                name="papergraph_reader_interpreter",
-                llm=self.llm,
-                system_prompt=READER_CHAT_SYSTEM,
-                config=papergraph_agent_config(),
-                enable_tool_calling=False,
-            )
-        return coerce_hello_agents_llm_output_to_str(self._reader_interpreter.run(prompt))
+        from ..services.llm.agent_runtime import run_agent_task
+        return run_agent_task(task_name="reader_interpreter", agent_name="reader_interpreter", llm=self.llm,
+                              system_prompt=READER_CHAT_SYSTEM, user_prompt=prompt, retries=0)
 
     def _reader_tool_on_found(self, papers: List[Any], source: str) -> None:
         with self._reader_lookup_lock:
@@ -267,18 +270,29 @@ class PaperAnalysisAgent(BaseAgent):
         seen: set[str] = set()
         out: List[Tuple[Any, str]] = []
         for p, src in buffer:
-            k = str(getattr(p, "title", "") or "").strip().lower()
-            if not k or k in seen:
+            title = str(getattr(p, "title", "") or "").strip().casefold()
+            if not title:
                 continue
-            seen.add(k)
+            keys = {"title:" + title}
+            doi = str(getattr(p, "doi", "") or "").strip().casefold().removeprefix("https://doi.org/")
+            arxiv = re.sub(r"v[0-9]+$", "", str(getattr(p, "arxiv_id", "") or "").strip().casefold())
+            if doi:
+                keys.add("doi:" + doi)
+            if arxiv:
+                keys.add("arxiv:" + arxiv)
+            if keys & seen:
+                continue
+            seen.update(keys)
             out.append((p, src))
         return out
     def _run_task(self, spec: TaskSpec, user: str) -> Any:
         prompt = _clip(user, spec.max_chars)
         try:
 
-            raw = spec.agent.run(prompt)
+            raw = _run_with_optional_timeout(lambda: spec.agent.run(prompt), 60)
         except Exception as exc:
+            if _task_failed_due_to_timeout(exc):
+                raise TimeoutError(f"paper_analysis_timeout:{spec.name}") from exc
             logger.exception("paper_analysis_llm_failed", extra={"task": spec.name})
             raise RuntimeError(f"paper_analysis_llm_failed:{spec.name}") from exc
 
@@ -293,7 +307,7 @@ class PaperAnalysisAgent(BaseAgent):
             # Some tool responses need a final explanation pass.
             if spec.name == "paper_reader_reply" and self._looks_like_raw_tool_output(raw_text):
                 logger.info("paper_reader: detected raw tool output, invoking interpreter")
-                raw_text = self._interpret_tool_output(raw_text, user)
+                raw_text = self._interpret_tool_output(raw_text, self._reader_last_user_message)
 
             return raw_text
 
@@ -302,7 +316,7 @@ class PaperAnalysisAgent(BaseAgent):
             return data
 
         try:
-            raw2 = spec.agent.run("请只输出合法 JSON。\n" + prompt)
+            raw2 = _run_with_optional_timeout(lambda: self._analysis.run("请只输出合法 JSON。\n" + prompt), 30)
             data2 = spec.parser((raw2 or "").strip())
             if data2 is not None:
                 return data2
@@ -336,7 +350,7 @@ class PaperAnalysisAgent(BaseAgent):
                 if clean:
                     parts.append("tags=" + ",".join(clean))
             line = " | ".join(parts)[:360]
-            am.add(agent_name="paper_analysis", content=line, memory_type="working", importance=0.55, shared=bool(shared))
+            am.add(agent_name="paper_analysis", content=line, memory_type="preference", importance=0.55, shared=bool(shared))
         except Exception:
             return
 
@@ -376,11 +390,13 @@ class PaperAnalysisAgent(BaseAgent):
         j = str(journal).strip()
         if j.startswith("arXiv:"):
             return "preprint"
-        if j in self._venue_type_cache:
-            return self._venue_type_cache[j]
+        from ..services.task_state import identity
+        key = identity("venue-v2", self._settings.data_dir, self.llm.model, getattr(self.llm, "base_url", ""), j)
+        if key in self._venue_type_cache:
+            return self._venue_type_cache[key]
         try:
             prompt = f'判断以下学术来源名称是会议(conference)还是期刊(journal)。只回复一个单词：conference 或 journal。\n\n名称：{j}'
-            resp = self._analysis.run(prompt)
+            resp = _run_with_optional_timeout(lambda: self._analysis.run(prompt), 20)
             result = str(resp).strip().lower()
             if "conference" in result:
                 vt = "conference"
@@ -391,7 +407,10 @@ class PaperAnalysisAgent(BaseAgent):
         except Exception:
             vt = None
         if vt:
-            self._venue_type_cache[j] = vt
+            check_active()
+            if len(self._venue_type_cache) >= 256:
+                self._venue_type_cache.pop(next(iter(self._venue_type_cache)), None)
+            self._venue_type_cache[key] = vt
         return vt
 
     def classify_for_library(
@@ -482,7 +501,13 @@ class PaperAnalysisAgent(BaseAgent):
             return cat, tags
         return default_cat, []
 
-    def paper_reader_reply(
+    def paper_reader_reply(self, context_block: str, history_lines: str, user_message: str,
+                           reader_snap: Optional[Dict[str, Any]] = None) -> Tuple[str, List[Any], List[str]]:
+        execution = copy.copy(self)
+        execution._init_reader_execution()
+        return _run_with_optional_timeout(lambda: execution._paper_reader_reply(context_block, history_lines, user_message, reader_snap), 120)
+
+    def _paper_reader_reply(
         self,
         context_block: str,
         history_lines: str,
@@ -492,6 +517,7 @@ class PaperAnalysisAgent(BaseAgent):
         snap: Dict[str, Any] = dict(reader_snap or {})
         self._reader_snap = snap
         reco_pid: Optional[int] = None
+        prior_recommendations = sum(1 for line in history_lines.splitlines() if line.startswith("用户：") and parse_reader_recommendation_intent(line)[0])
         try:
             spid = snap.get("paper_id")
             if spid is not None and int(spid) > 0:
@@ -503,28 +529,19 @@ class PaperAnalysisAgent(BaseAgent):
                 self._reader_lookup_buffer.clear()
             ctx = _prioritize_reader_context(context_block, max_chars=3600)
             hist = _clip_reader_history((history_lines or "").strip() or "（尚无此前对话）", max_chars=2200)
-            um = _clip(user_message, 900)
+            um = str(user_message or "").strip()
             want_reco, reco_max = parse_reader_recommendation_intent(um)
             self._reader_last_user_message = um
 
             try:
                 from ..services.memory.agent_memory import get_agent_memory
 
-                mem_block = get_agent_memory().build_context_block(agent_name="paper_analysis", query=um)
+                mem_block = get_agent_memory(snap.get("_db_path")).build_context_block(agent_name="paper_analysis", query=um)
             except Exception:
                 mem_block = ""
-            user = (
-                (f"【共享/独立记忆】\n{mem_block}\n\n" if mem_block else "")
-                + f"【当前文献材料】\n{ctx}\n\n"
-                + f"【对话历史】\n{hist}\n\n"
-                + f"【用户最新问题】\n{um}"
-            )
-            spec = TaskSpec(
-                name="paper_reader_reply",
-                agent=self._reader,
-                parser=None,
-                max_chars=7200,
-            )
+            user = build_reader_prompt(um, ctx, hist, mem_block, model=getattr(self.llm, "model", "gpt-4"),
+                                       max_tokens=min(12000, self._settings.agent_context_window // 2))
+            spec = TaskSpec(name="paper_reader_reply", agent=self._reader, parser=None, max_chars=len(user))
             out = self._run_task(spec, user)
             # Clean up mixed tool/user-facing output.
             if isinstance(out, str) and out.strip():
@@ -552,7 +569,7 @@ class PaperAnalysisAgent(BaseAgent):
                     extra: List[Any] = []
                     if snap.get("references"):
                         refs_full = [str(x).strip() for x in (snap.get("references") or []) if str(x).strip()]
-                        off = self._reader_reco_ref_offset.get(reco_pid, 0) if reco_pid else 0
+                        off = self._reader_reco_ref_offset.get(reco_pid, prior_recommendations * 2) if reco_pid else 0
                         snap_res: Dict[str, Any] = snap
                         if want_reco and reco_pid and refs_full and off >= len(refs_full):
                             off = 0
@@ -594,7 +611,7 @@ class PaperAnalysisAgent(BaseAgent):
                         else:
                             ref_lines = ref_core
                         if ref_lines:
-                            off = self._reader_reco_ref_offset.get(reco_pid, 0) if reco_pid else 0
+                            off = self._reader_reco_ref_offset.get(reco_pid, prior_recommendations * 2) if reco_pid else 0
                             if want_reco and reco_pid and off >= len(ref_lines):
                                 off = 0
                                 self._reader_reco_ref_offset[reco_pid] = 0
@@ -622,10 +639,9 @@ class PaperAnalysisAgent(BaseAgent):
                                     extra = _gf(0.54)
                                     if not extra and want_reco:
                                         extra = _gf(0.42)
-                                    if not extra and want_reco and raw_extra:
-                                        extra = list(raw_extra)[: max(1, min(len(raw_extra), fb_max))]
                                 if extra and want_reco and reco_pid:
                                     self._reader_reco_ref_offset[reco_pid] = off + max(1, len(extra))
+                    pairs.extend((paper, READER_RELATED_FROM_BIBLIOGRAPHY if snap.get("references") else READER_RELATED_FROM_REF_BLOCK) for paper in extra)
                 except Exception:
                     logger.debug("reader_reference_server_fallback_failed", exc_info=True)
 
@@ -633,12 +649,12 @@ class PaperAnalysisAgent(BaseAgent):
                 (want_reco or user_message_may_need_reference_lookup(um))
                 and not reader_user_allows_external_paper_lookup(um)
             )
-            pairs = [(p, s) for p, s in pairs if not paper_matches_reader_snap(snap, p)]
+            pairs = [(p, s) for p, s in self._dedupe_reader_paper_pairs(pairs) if not paper_matches_reader_snap(snap, p)]
             if bib_only:
                 pairs = [
                     (p, s)
                     for p, s in pairs
-                    if s in (READER_RELATED_FROM_BIBLIOGRAPHY, READER_RELATED_FROM_REF_BLOCK, READER_RELATED_FROM_PRE_SEARCH)
+                    if s in (READER_RELATED_FROM_BIBLIOGRAPHY, READER_RELATED_FROM_REF_BLOCK)
                 ]
             if want_reco and pairs:
                 try:
@@ -698,76 +714,12 @@ class PaperAnalysisAgent(BaseAgent):
                 else:
                     text_out = "（本次未收到模型有效正文。请稍后重试，或缩短问题后再次提问。）"
 
-            try:
-                from ..services.memory.agent_memory import get_agent_memory
-
-                am = get_agent_memory()
-                am.add(agent_name="paper_analysis", content=f"用户问：{um}", memory_type="working", importance=0.55, shared=False)
-                am.add(agent_name="paper_analysis", content=f"助手答：{text_out[:240]}", memory_type="working", importance=0.5, shared=False)
-                am.add(agent_name="paper_analysis", content=f"阅读问答要点：{text_out[:180]}", memory_type="working", importance=0.55, shared=True)
-            except Exception:
-                pass
-
-            logger.info("reader_post: text_out_len=%d papers=%d want_reco=%s",
-                        len(text_out or ""), len(papers), want_reco)
-            if text_out and len(text_out) >= 80:
-                try:
-                    prompt = (
-                        "从以下学术助手的回复中，提取被推荐的论文信息。\n"
-                        "返回纯 JSON 数组，每项可含 title（英文题名）和/或 arxiv_id（如 2307.05973）。\n"
-                        '格式：[{"title": "...", "arxiv_id": "..."}, ...]\n'
-                        "若回复未推荐具体论文，返回 []。\n\n"
-                        "回复原文：\n" + text_out[:3000]
-                    )
-                    raw = self.llm.invoke([{"role": "user", "content": prompt}])
-                    llm_text = coerce_hello_agents_llm_output_to_str(raw)
-                    import json as _json
-                    extracted = _json.loads(llm_text.strip().removeprefix("```json").removesuffix("```").strip())
-                    if isinstance(extracted, list) and extracted:
-                        logger.info("reader_llm_extract: got %d papers from LLM", len(extracted))
-                        try:
-                            from app.api.dependencies import get_searcher as _es
-                            from app.services.papers.papers_converters import litpaper_to_api_paper as _ep
-                            ese = _es()
-                            existing_titles = {str(getattr(p, "title", "") or "").strip().lower() for p in papers}
-                            existing_titles.add(str(snap.get("title") or "").strip().lower())
-                            for item in extracted[:6]:
-                                if not isinstance(item, dict):
-                                    continue
-                                title = str(item.get("title") or "").strip()
-                                axid = str(item.get("arxiv_id") or "").strip()
-
-                                if axid and re.match(r"^\d{4}\.\d{4,5}", axid):
-                                    try:
-                                        for fp in (ese.search_arxiv("", max_results=2, arxiv_id_list=axid,
-                                                http_timeout_sec=8, http_max_attempts=1) or []):
-                                            afp = _ep(fp)
-                                            tafp = str(getattr(afp, "title", "") or "").strip().lower()
-                                            if tafp and tafp not in existing_titles:
-                                                existing_titles.add(tafp)
-                                                papers.insert(0, afp)
-                                                provenances.insert(0, READER_RELATED_FROM_PRE_SEARCH)
-                                                logger.info("reader_llm_extract: added by arxiv %s", axid)
-                                    except Exception:
-                                        continue
-
-                                if title and len(title) >= 4:
-                                    try:
-                                        for fp in (ese.search_openalex(title, max_results=2, venue_proceedings_journal=False) or []):
-                                            afp = _ep(fp)
-                                            tafp = str(getattr(afp, "title", "") or "").strip().lower()
-                                            if tafp and tafp not in existing_titles:
-                                                existing_titles.add(tafp)
-                                                papers.insert(0, afp)
-                                                provenances.insert(0, READER_RELATED_FROM_PRE_SEARCH)
-                                                logger.info("reader_llm_extract: added by title %s", tafp[:80])
-                                    except Exception:
-                                        continue
-                        except Exception as e:
-                            logger.warning("reader_llm_extract_search_failed: %s", e)
-                except Exception as e:
-                    logger.warning("reader_llm_extract_failed: %s", e)
-
+            if want_reco and papers:
+                # 模型生成后还有去重、证据筛选和重排，重新建立最终卡片序号。
+                text_out = re.sub(r"(?<!!)\[\d+(?:\s*[,，、-]\s*\d+)*\](?!\()", "", text_out)
+                verified = "\n".join(f"[{i}] {getattr(paper, 'title', '')}" for i, paper in enumerate(papers, 1))
+                text_out = text_out.rstrip() + "\n\n本轮核实的论文（与推荐卡片顺序一致）：\n" + verified
+            check_active()
             return (text_out, papers, provenances)
         finally:
             self._reader_snap = {}

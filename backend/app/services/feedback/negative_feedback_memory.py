@@ -7,7 +7,8 @@ import sqlite3
 import time
 from typing import Any
 
-from ..llm.agent_runtime import run_json_task
+from ..llm.agent_runtime import run_json_task, check_active
+from ..llm.structured_output import NegativePreference
 from ..llm.llm_service import get_llm
 from ...utils.common import exec_sql
 
@@ -120,12 +121,13 @@ def maybe_promote_longterm_from_recent_skips(
                 (kind, value, float(weight), now, int(ev.get("last_seen_at") or now), 1, json.dumps(ev, ensure_ascii=False)),
             )
             promoted.append((kind, value))
+        check_active()
         conn.commit()
         return promoted
     finally:
         conn.close()
 
-def record_skip_negative_pref(
+def _record_skip_negative_pref(
     db_path: str,
     *,
     identity_key: str,
@@ -136,11 +138,17 @@ def record_skip_negative_pref(
     keywords: list[str | None] = None,
     category: str | None = None,
     ttl_days: int = 14,
+    expected_revision: int | None = None,
 ) -> bool:
     ensure_tables(db_path)
     ttl = max(1, min(60, int(ttl_days or 14)))
     now = int(time.time())
     exp = now + ttl * 86400
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT 1 FROM negative_pref_memory WHERE identity_key=? AND created_at>=? LIMIT 1", ((identity_key or "")[:160], now - 86400)).fetchone()
+        if row:
+            return True
 
     system_prompt = (
         "你是推荐系统的反馈分析器。用户点了「不感兴趣(skip)」。"
@@ -162,21 +170,34 @@ def record_skip_negative_pref(
     payload = run_json_task(
         task_name="negative_pref_summarizer", agent_name="neg_pref_summarizer",
         llm=get_llm(), system_prompt=system_prompt, user_prompt=prompt,
-        timeout_sec=10.0, retries=1, default={},
+        timeout_sec=10.0, retries=1, output_model=NegativePreference,
     )
-    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    check_active()
+    payload_json = json.dumps(payload, ensure_ascii=False)
 
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if expected_revision is not None:
+            row = conn.execute("SELECT revision FROM daily_cache_revision WHERE id=1").fetchone()
+            if (int(row[0]) if row else 0) != expected_revision:
+                return False
         cur = conn.cursor()
         cur.execute(
             """INSERT INTO negative_pref_memory(created_at, expires_at, identity_key, title, payload_json)
             VALUES (?, ?, ?, ?, ?)""",
             (now, exp, (identity_key or "")[:160], (title or "")[:400], payload_json),
         )
+        check_active()
         conn.commit()
         return True
     except Exception:
         return False
     finally:
         conn.close()
+
+
+def record_skip_negative_pref(db_path: str, *, identity_key: str, **kwargs) -> bool:
+    from ..task_state import task_lock, identity
+    with task_lock(identity("negative-feedback", db_path, identity_key)):
+        return _record_skip_negative_pref(db_path, identity_key=identity_key, **kwargs)

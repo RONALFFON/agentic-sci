@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.llm.agent_runtime import run_sync
+
 import asyncio
 import html
 import logging
@@ -80,7 +82,7 @@ async def _llm_extract_papers_from_page(
         f"页面文本：\n{clipped}"
     )
     try:
-        data = await anyio.to_thread.run_sync(
+        data = await run_sync(
             lambda: run_json_task(
                 task_name="proceedings_page_extract",
                 agent_name="papergraph_proceedings_extractor",

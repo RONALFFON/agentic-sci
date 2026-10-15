@@ -96,6 +96,8 @@ def _intent_use_tavily_raw(nested: bool, flags: dict[str, Any], d: dict[str, Any
     return d.get("use_tavily")
 
 def search_intent_from_dict(d: dict[str, Any]) -> SearchIntent:
+    from ..llm.structured_output import validate_intent_payload
+    validate_intent_payload(d)
     nested = isinstance(d.get("search"), dict)
     if nested:
         s = dict(d["search"])

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from ...settings import get_settings
+from ..llm.agent_runtime import check_active
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,8 @@ class MemoryStore:
     def ensure_tables(self) -> None:
         conn = self._connect()
         try:
+            check_active()
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS paper_memory (
@@ -115,6 +118,7 @@ class MemoryStore:
                 conn.execute("ALTER TABLE paper_memory ADD COLUMN embed_model TEXT")
             if "embed_dim" not in cols:
                 conn.execute("ALTER TABLE paper_memory ADD COLUMN embed_dim INTEGER")
+            check_active()
             conn.commit()
         finally:
             conn.close()
@@ -129,6 +133,7 @@ class MemoryStore:
         importance: float = 0.5,
         shared: bool = False,
     ) -> int | None:
+        check_active()
         text = str(content or "").strip()
         if not text:
             return None
@@ -137,6 +142,11 @@ class MemoryStore:
         now = int(time.time())
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT id FROM paper_memory WHERE scope=? AND paper_id IS ? AND kind=? AND content=? AND created_at>=? ORDER BY id DESC LIMIT 1", (scope2, paper_id, kind2, text[:4000], now - 86400)).fetchone()
+            if existing:
+                return int(existing[0])
+            check_active()
             cur = conn.execute(
                 """
                 INSERT INTO paper_memory
@@ -149,10 +159,11 @@ class MemoryStore:
                     kind2,
                     text[:4000],
                     max(0.0, min(1.0, float(importance or 0.5))),
-                    1 if shared else 0,
+                    1 if shared and kind2 == "preference" else 0,
                     now,
                 ),
             )
+            check_active()
             conn.commit()
             row_id = int(cur.lastrowid)
         finally:
@@ -194,7 +205,7 @@ class MemoryStore:
         finally:
             conn.close()
 
-    def get_context_for_query(self, *, paper_id: int, query: str, limit: int = 6) -> str:
+    def get_context_for_query(self, *, paper_id: int | None, query: str, limit: int = 6) -> str:
         limit2 = max(1, min(int(limit or 6), 30))
         q = str(query or "").strip()
         query_tokens = _tokens(q)
@@ -202,14 +213,14 @@ class MemoryStore:
         try:
             rows = conn.execute(
                 """
-                SELECT content, importance, created_at, embedding, embed_model
+                SELECT content, kind, importance, created_at, embedding, embed_model
                 FROM paper_memory
                 WHERE (scope = 'paper' AND paper_id = ?)
-                   OR shared = 1
+                   OR (shared = 1 AND kind = 'preference')
                 ORDER BY importance DESC, created_at DESC, id DESC
                 LIMIT 120
                 """,
-                (int(paper_id),),
+                (int(paper_id) if paper_id is not None else None,),
             ).fetchall()
         finally:
             conn.close()
@@ -247,10 +258,13 @@ class MemoryStore:
                 if row_vec is not None and str(row["embed_model"] or "") == cur_model:
                     sem = max(0.0, _dot(qvec, row_vec))
             score = overlap * kw_w + sem * sem_w + float(row["importance"] or 0.5) + recency * 0.1
-            scored.append((score, content))
+            label = "用户偏好" if row["kind"] == "preference" else "历史模型推断，未经原文验证" if row["kind"] in ("short", "working", "model_summary") else "论文记忆，仍须核对原文"
+            if q and row["kind"] == "preference" and not overlap and sem < 0.2:
+                continue
+            scored.append((score, f"{content} [{label}]"))
         scored.sort(key=lambda x: x[0], reverse=True)
         selected = [content for _, content in scored[:limit2]]
-        return "【论文记忆】\n" + "\n".join(f"- {x}" for x in selected) if selected else ""
+        return "【记忆参考：不是当前论文的事实证据】\n" + "\n".join(f"- {x}" for x in selected) if selected else ""
 
     def build_context_block(self, *, paper_id: int, limit: int = 10) -> str:
         return self.get_context_for_query(paper_id=int(paper_id), query="", limit=limit)
@@ -275,6 +289,7 @@ class MemoryStore:
                     "UPDATE paper_memory SET embedding = ?, embed_model = ?, embed_dim = ? WHERE id = ?",
                     (_vec_to_blob(vec), model, len(vec), int(row_id)),
                 )
+                check_active()
                 conn.commit()
             finally:
                 conn.close()
@@ -329,6 +344,7 @@ class MemoryStore:
                         (_vec_to_blob(vec), model, len(vec), rid),
                     )
                     processed += 1
+                check_active()
                 conn.commit()
             finally:
                 conn.close()
@@ -350,7 +366,7 @@ class MemoryStore:
         self.add(
             scope="paper",
             paper_id=int(paper_id),
-            kind="short",
+            kind="model_summary",
             content=content,
             importance=0.55,
         )
@@ -360,7 +376,7 @@ class MemoryStore:
         keep = max(12, int(min_entries or 6) * 4)
         conn = self._connect()
         try:
-            where = ["scope = ?", "kind = 'working'"]
+            where = ["scope = ?", "kind IN ('working', 'short', 'model_summary')"]
             params: list[object] = [str(scope or "global")]
             if paper_id is None:
                 where.append("paper_id IS NULL")
@@ -375,6 +391,7 @@ class MemoryStore:
             ).fetchall()
             if ids:
                 conn.executemany("DELETE FROM paper_memory WHERE id = ?", [(int(row[0]),) for row in ids])
-                conn.commit()
+                check_active()
+            conn.commit()
         finally:
             conn.close()

@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     )
 
     # ── Agent 运行时 ──
+    agent_context_window: int = Field(default=32768, ge=8192, le=1048576)
+    agent_runtime_max_workers: int = Field(default=8, ge=1, le=64)
+    agent_request_timeout_sec: float = Field(default=180.0, ge=1, le=600)
+    papergraph_timezone: str = Field(default="Asia/Shanghai")
     agent_runtime_default_timeout_sec: float = Field(
         default=20.0,
         ge=1.0,

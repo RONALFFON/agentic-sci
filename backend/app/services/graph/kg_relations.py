@@ -7,6 +7,10 @@ import logging
 import re
 import sqlite3
 import threading
+from pathlib import Path
+from ..task_state import identity, task_lock, file_version
+from ..llm.agent_runtime import check_active
+from ..llm.structured_output import finite_score
 import time
 from typing import Any
 
@@ -16,8 +20,6 @@ from ..reader.paper_reader_context import extract_pdf_text_full_cached, extract_
 from ...utils import normalize_arxiv_id as _norm_arxiv_id
 
 logger = logging.getLogger(__name__)
-
-_kg_infer_lock = threading.Lock()
 
 _kg_recent_fingerprints: dict[str, float] = {}
 _kg_fingerprints_lock = threading.Lock()
@@ -60,6 +62,13 @@ def ensure_tables(db_path: str) -> None:
         "CREATE INDEX IF NOT EXISTS idx_paper_relations_target ON paper_relations(target_paper_id)",
         "CREATE INDEX IF NOT EXISTS idx_paper_relations_relation ON paper_relations(relation)",
     )
+
+    with task_lock(identity("kg-migration", db_path)):
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_relations)")}
+            if "evidence_json" not in columns:
+                conn.execute("ALTER TABLE paper_relations ADD COLUMN evidence_json TEXT")
+
 
 @suppress_exceptions(default_return=[])
 def _loads_json_list(x: str | None) -> list[Any]:
@@ -215,6 +224,16 @@ def fetch_new_and_candidates(
         (int(new_paper_id), int(lexical_pool)),
     )
     pool_rows = cur.fetchall()
+    # 同时取历史分类候选与最早入库样本，避免候选只覆盖最近入库文献。
+    cur.execute("SELECT * FROM papers WHERE id != ? AND (category = ? OR category LIKE ?) ORDER BY created_at ASC LIMIT ?",
+                (int(new_paper_id), cat, f"{cat.split('/')[0]}%" if cat else "", max(1, lexical_pool // 3)))
+    pool_rows += cur.fetchall()
+    refs = list(_reference_signatures(new_meta.get("references") or []))[:100]
+    if refs:
+        placeholders = ",".join("?" for _ in refs)
+        cur.execute(f"SELECT * FROM papers WHERE id != ? AND (lower(doi) IN ({placeholders}) OR arxiv_id IN ({placeholders})) LIMIT 64",
+                    (int(new_paper_id), *refs, *refs))
+        sql_metas = [_row_to_paper_meta(row) for row in cur.fetchall()] + sql_metas
     conn.close()
 
     new_lex = _lexical_token_set(new_meta)
@@ -255,42 +274,41 @@ def fetch_new_and_candidates(
 
     return new_meta, out[: int(k)]
 
-def upsert_relations(db_path: str, source_paper_id: int, edges: list[dict[str, Any]]) -> int:
+def upsert_relations(db_path: str, source_paper_id: int, edges: list[dict[str, Any]], *, validated_model: bool = False) -> int:
+    check_active()
     ensure_tables(db_path)
     now = int(time.time())
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
     n = 0
-    for e in edges:
-        try:
-            tid = int(e.get("target_paper_id"))
-        except Exception:
-            continue
-        rel = str(e.get("relation") or "").strip()[:32]
-        if len(rel) < 2 or len(rel) > 32:
-            continue
-        try:
-            score = float(e.get("score") or 0.0)
-        except Exception:
-            score = 0.0
-        ev = str(e.get("evidence") or "").strip()[:240]
-        if tid <= 0 or tid == int(source_paper_id):
-            continue
-        cur.execute(
-            """
-            INSERT INTO paper_relations(source_paper_id, target_paper_id, relation, score, evidence, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_paper_id, target_paper_id, relation) DO UPDATE SET
-              score=excluded.score,
-              evidence=excluded.evidence,
-              updated_at=excluded.updated_at
-            """,
-            (int(source_paper_id), int(tid), rel, float(score), ev, now, now),
-        )
-        n += 1
-    conn.commit()
-    conn.close()
+    allowed = {"improves", "extends", "uses", "compares", "surveys", "references", "dataset_overlap", "method_overlap", "task_overlap"}
+    with sqlite3.connect(db_path) as conn:
+        for edge in edges:
+            try:
+                if type(edge.get("target_paper_id")) is not int:
+                    continue
+                target = edge["target_paper_id"]
+                relation = edge.get("relation")
+                score = finite_score(edge.get("score"))
+                evidence = str(edge.get("evidence") or "").strip()[:800]
+                if not isinstance(relation, str) or not 2 <= len(relation) <= 32 or (validated_model and relation not in allowed) or not evidence or target <= 0 or target == int(source_paper_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            provenance = json.dumps({
+                "version": "kg-v2", "source_paper_id": int(source_paper_id), "target_paper_id": target,
+                "location": edge.get("evidence_location") or "unspecified",
+                "quote": edge.get("evidence_quote") or "", "source_version": edge.get("source_version"),
+                "kind": ("text_anchored_model_inference" if edge.get("evidence_quote") else "model_inference") if validated_model else "user_edited",
+            }, ensure_ascii=False)
+            check_active()
+            conn.execute("""INSERT INTO paper_relations
+                (source_paper_id,target_paper_id,relation,score,evidence,created_at,updated_at,evidence_json)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source_paper_id,target_paper_id,relation) DO UPDATE SET
+                score=excluded.score,evidence=excluded.evidence,updated_at=excluded.updated_at,evidence_json=excluded.evidence_json""",
+                (int(source_paper_id), target, relation, score, evidence, now, now, provenance))
+            n += 1
+        check_active()
     return n
+
 
 def delete_relation(db_path: str, source_paper_id: int, target_paper_id: int, relation: str) -> bool:
     ensure_tables(db_path)
@@ -332,23 +350,13 @@ def build_relations_for_new_paper(db_path: str, new_paper_id: int) -> int:
             _t = (new_meta.get("title") or "").strip().lower()[:160]
             fp = f"title:{_t}"
 
-    with _kg_fingerprints_lock:
-        last = _kg_recent_fingerprints.get(fp)
-        if last is not None and (now - last) < _KG_DEDUP_WINDOW_SEC:
-            with _kg_metrics_lock:
-                _kg_metrics["build_skip_dedup"] = _kg_metrics.get("build_skip_dedup", 0) + 1
-            logger.info(
-                "kg_build_skip_dedup",
-                extra={"paper_id": int(new_paper_id), "fingerprint": fp},
-            )
-            return 0
-        _kg_recent_fingerprints[fp] = now
-
+    original_file = file_version(_pdf_abspath_from_row(db_path, new_meta.get("local_pdf_path")))
+    fp = identity(str(Path(db_path).resolve()), fp, new_meta, cands, original_file, "kg-v2")
     try:
         pdf_abspath = _pdf_abspath_from_row(db_path, new_meta.get("local_pdf_path"))
         if pdf_abspath:
             excerpt, _hit = extract_pdf_text_full_cached(
-                db_path, int(new_paper_id), pdf_abspath, max_chars=9000
+                db_path, int(new_paper_id), pdf_abspath
             )
             if not excerpt.strip():
                 excerpt = extract_pdf_text_full(pdf_abspath)
@@ -364,12 +372,23 @@ def build_relations_for_new_paper(db_path: str, new_paper_id: int) -> int:
             exc_info=exc,
         )
 
-    edges: list[dict[str, Any]] = []
-    with _kg_infer_lock:
+    with task_lock("kg:" + fp):
+        with _kg_fingerprints_lock:
+            last = _kg_recent_fingerprints.get(fp)
+            if last is not None and time.time() - last < _KG_DEDUP_WINDOW_SEC:
+                return 0
+        check_active()
         agent = get_knowledge_graph_agent()
         edges, _ = agent.infer_edges(new_paper=new_meta, candidates=cands)
+        check_active()
+        if file_version(_pdf_abspath_from_row(db_path, new_meta.get("local_pdf_path"))) != original_file:
+            return 0
+        for edge in edges:
+            edge["source_version"] = original_file
+        n = upsert_relations(db_path, int(new_paper_id), edges, validated_model=True)
+        with _kg_fingerprints_lock:
+            _kg_recent_fingerprints[fp] = time.time()
 
-    n = upsert_relations(db_path, int(new_paper_id), edges)
     if n:
         with _kg_metrics_lock:
             _kg_metrics["relations_upserted"] = _kg_metrics.get("relations_upserted", 0) + n

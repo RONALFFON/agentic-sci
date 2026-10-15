@@ -63,9 +63,9 @@ class AgentMemory:
         where = ["1=1"]
         params: list[object] = []
         if shared or agent_name == "shared":
-            where.append("shared = 1")
+            where.append("shared = 1 AND kind = 'preference'")
         else:
-            where.append("(scope = ? OR shared = 1)")
+            where.append("(scope = ? OR (shared = 1 AND kind = 'preference'))")
             params.append(f"agent:{agent_name}")
         if kinds:
             where.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
@@ -84,22 +84,10 @@ class AgentMemory:
             conn.close()
 
     def build_context_block(self, *, agent_name: str, query: str = "", limit: int = 12) -> str:
-        lines = self.recent(
-            agent_name=agent_name,
-            memory_types=["preference", "working", "episodic", "short"],
-            limit=max(1, int(limit or 12)),
-            shared=False,
-        )
-        if query:
-            q_tokens = set(_TOKEN_RE.sub(" ", query.lower()).split())
-            lines.sort(
-                key=lambda x: len(q_tokens & set(_TOKEN_RE.sub(" ", x.lower()).split())),
-                reverse=True,
-            )
-        return "【Agent 共享记忆】\n" + "\n".join(f"- {x}" for x in lines) if lines else ""
+        return self.store.get_context_for_query(paper_id=None, query=query, limit=limit)
 
     def keywords_from_shared(self, *, limit_lines: int = 50, tokens_cap: int = 120) -> set[str]:
-        texts = self.recent(agent_name="shared", memory_types=["working", "episodic"], limit=limit_lines, shared=True)
+        texts = self.recent(agent_name="shared", memory_types=["preference"], limit=limit_lines, shared=True)
         freq: dict[str, int] = {}
         for text in texts:
             for token in _TOKEN_RE.sub(" ", text.lower()).split():
@@ -113,7 +101,7 @@ _instances: dict[str, AgentMemory] = {}
 
 
 def get_agent_memory(db_path: str | None = None) -> AgentMemory:
-    resolved = str(db_path or os.path.join(get_settings().data_dir, "papers.db"))
+    resolved = str(Path(db_path or os.path.join(get_settings().data_dir, "papers.db")).resolve())
     if resolved not in _instances:
         _instances[resolved] = AgentMemory(resolved)
     return _instances[resolved]

@@ -2,9 +2,12 @@
 
 import logging
 import os
-from functools import wraps
+import asyncio
+import anyio
+import copy
+import threading
+import time
 from typing import Any
-from collections.abc import Callable
 
 from hello_agents import HelloAgentsLLM
 from ...settings import get_settings
@@ -35,70 +38,120 @@ def normalize_openai_compatible_chat_messages(messages: Any) -> Any:
         out.append(m)
     return out
 
-def _patch_hello_agents_llm_openai_chat_roles() -> None:
-    marker = "_papergraph_openai_role_normalize_applied"
-    if getattr(HelloAgentsLLM, marker, False):
-        return
-
-    def _wrap(orig: Callable[..., Any]) -> Callable[..., Any]:
-        @wraps(orig)
-        def inner(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if args and isinstance(args[0], list):
-                args = (normalize_openai_compatible_chat_messages(args[0]),) + tuple(args[1:])
-            elif isinstance(kwargs.get("messages"), list):
-                kwargs = dict(kwargs)
-                kwargs["messages"] = normalize_openai_compatible_chat_messages(kwargs["messages"])
-            return orig(self, *args, **kwargs)
-
-        return inner
-
-    HelloAgentsLLM.invoke = _wrap(HelloAgentsLLM.invoke)
-    if hasattr(HelloAgentsLLM, "invoke_with_tools"):
-        HelloAgentsLLM.invoke_with_tools = _wrap(HelloAgentsLLM.invoke_with_tools)
-    for _async_name in ("ainvoke", "async_invoke"):
-        if hasattr(HelloAgentsLLM, _async_name):
-            setattr(HelloAgentsLLM, _async_name, _wrap(getattr(HelloAgentsLLM, _async_name)))
-    setattr(HelloAgentsLLM, marker, True)
-    logger.debug("HelloAgentsLLM: patched invoke* for OpenAI-compatible message roles (summary→user)")
-
-_patch_hello_agents_llm_openai_chat_roles()
-
-def _patch_deepseek_disable_thinking() -> None:
-    marker = "_papergraph_deepseek_thinking_disabled"
-    if getattr(HelloAgentsLLM, marker, False):
-        return
-
-    import re as _re
-
-    def _is_deepseek(llm_self: Any) -> bool:
-        base = str(getattr(getattr(llm_self, "_adapter", None), "base_url", "") or "")
-        return bool(_re.search(r"deepseek", base, _re.I))
-
-    def _wrap(orig: Callable[..., Any]) -> Callable[..., Any]:
-        @wraps(orig)
-        def inner(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if _is_deepseek(self):
-                kwargs = dict(kwargs)
-                extra = dict(kwargs.get("extra_body") or {})
-                if "thinking" not in extra:
-                    extra["thinking"] = {"type": "disabled"}
-                kwargs["extra_body"] = extra
-            return orig(self, *args, **kwargs)
-
-        return inner
-
-    HelloAgentsLLM.invoke = _wrap(HelloAgentsLLM.invoke)
-    if hasattr(HelloAgentsLLM, "invoke_with_tools"):
-        HelloAgentsLLM.invoke_with_tools = _wrap(HelloAgentsLLM.invoke_with_tools)
-    for _async_name in ("ainvoke", "async_invoke"):
-        if hasattr(HelloAgentsLLM, _async_name):
-            setattr(HelloAgentsLLM, _async_name, _wrap(getattr(HelloAgentsLLM, _async_name)))
-    setattr(HelloAgentsLLM, marker, True)
-    logger.debug("HelloAgentsLLM: patched invoke* to disable thinking mode for DeepSeek")
-
-_patch_deepseek_disable_thinking()
-
 _llm_instance: HelloAgentsLLM | None = None
+_llm_lock = threading.Lock()
+
+
+class PaperGraphLLM(HelloAgentsLLM):
+    """实例级兼容适配，不修改 HelloAgents 的全局类或进程代理环境。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._client_lock = threading.Lock()
+
+    def _options(self, kwargs):
+        from .agent_runtime import remaining_seconds
+        options = dict(kwargs)
+        options.setdefault("temperature", self.temperature)
+        if self.max_tokens:
+            options.setdefault("max_tokens", self.max_tokens)
+        options["timeout"] = min(float(options.get("timeout") or self.timeout), remaining_seconds(self.timeout))
+        if "deepseek" in str(self.base_url or "").lower():
+            extra = dict(options.get("extra_body") or {})
+            extra.setdefault("thinking", {"type": "disabled"})
+            options["extra_body"] = extra
+        return options
+
+    def _local_adapter(self, *, asynchronous=False):
+        adapter = copy.copy(self._adapter)
+        attr = "_async_client" if asynchronous else "_client"
+        with self._client_lock:
+            client = getattr(self._adapter, attr, None)
+            if client is None:
+                client = self._adapter.create_async_client() if asynchronous else self._adapter.create_client()
+                if hasattr(client, "with_options"):
+                    client = client.with_options(max_retries=0)
+                setattr(self._adapter, attr, client)
+        setattr(adapter, attr, client)
+        return adapter
+
+    def _call(self, method, messages, **kwargs):
+        from .agent_runtime import _run_with_optional_timeout, check_active, request_id, record_llm_call
+        options = self._options(kwargs)
+        options.setdefault("temperature", self.temperature)
+        if self.max_tokens:
+            options.setdefault("max_tokens", self.max_tokens)
+        started = time.monotonic()
+        status = "error"
+        usage = None
+        try:
+            adapter = self._local_adapter()
+            result = _run_with_optional_timeout(lambda: getattr(adapter, method)(normalize_openai_compatible_chat_messages(messages), **options), options["timeout"])
+            check_active()
+            usage = getattr(result, "usage", None)
+            if hasattr(usage, "model_dump"):
+                usage = usage.model_dump()
+            status = "success"
+            return result
+        finally:
+            record_llm_call(status, usage)
+            logger.info("llm_call request_id=%s method=%s model=%s status=%s duration_ms=%d usage=%s", request_id(), method, self.model, status, (time.monotonic()-started)*1000, usage)
+
+    def invoke(self, messages, **kwargs):
+        return self._call("invoke", messages, **kwargs)
+
+    def invoke_with_tools(self, messages, tools, tool_choice="auto", **kwargs):
+        return self._call("invoke_with_tools", messages, tools=tools, tool_choice=tool_choice, **kwargs)
+
+    async def ainvoke(self, messages, **kwargs):
+        from .agent_runtime import run_sync
+        return await run_sync(self.invoke, messages, **kwargs)
+
+    async def ainvoke_with_tools(self, messages, tools, tool_choice="auto", **kwargs):
+        from .agent_runtime import run_sync
+        return await run_sync(self.invoke_with_tools, messages, tools, tool_choice=tool_choice, **kwargs)
+
+    def stream_invoke(self, messages, **kwargs):
+        from .agent_runtime import execution_scope, check_active, _run_with_optional_timeout, remaining_seconds, record_llm_call, request_id
+        options = self._options(kwargs)
+        with execution_scope(options["timeout"]):
+            stream = self._local_adapter().stream_invoke(normalize_openai_compatible_chat_messages(messages), **options)
+            sentinel = object()
+            started, status = time.monotonic(), "error"
+            try:
+                while True:
+                    chunk = _run_with_optional_timeout(lambda: next(stream, sentinel), remaining_seconds())
+                    if chunk is sentinel:
+                        status = "success"
+                        break
+                    check_active()
+                    yield chunk
+            finally:
+                try:
+                    stream.close()
+                except (ValueError, RuntimeError):
+                    pass
+                record_llm_call(status)
+                logger.info("llm_call request_id=%s method=stream_invoke model=%s status=%s duration_ms=%d usage=missing", request_id(), self.model, status, (time.monotonic()-started)*1000)
+
+    async def astream_invoke(self, messages, **kwargs):
+        from .agent_runtime import execution_scope, check_active, request_id, record_llm_call
+        options = self._options(kwargs)
+        with execution_scope(options["timeout"]):
+            from ..task_state import async_task_lock
+            channel = hash(request_id() or id(messages)) % get_settings().agent_runtime_max_workers
+            started, status = time.monotonic(), "error"
+            try:
+                async with async_task_lock(f"llm-stream:{channel}"):
+                    with anyio.fail_after(options["timeout"]):
+                        async for chunk in self._local_adapter(asynchronous=True).astream_invoke(normalize_openai_compatible_chat_messages(messages), **options):
+                            check_active()
+                            yield chunk
+                        status = "success"
+            finally:
+                record_llm_call(status)
+                logger.info("llm_call request_id=%s method=astream_invoke model=%s status=%s duration_ms=%d usage=missing", request_id(), self.model, status, (time.monotonic()-started)*1000)
+
 
 def coerce_hello_agents_llm_output_to_str(out: Any) -> str:
     if out is None:
@@ -123,124 +176,43 @@ def coerce_hello_agents_llm_output_to_str(out: Any) -> str:
                 return c
     return str(out)
 
-def _maybe_disable_proxy_for_llm(base_url: str) -> None:
-    url = (base_url or "").strip()
-    if not url:
-        return
-
-    disable = get_settings().llm_disable_proxy
-    proxy_vars = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-    has_proxy = any(str(os.getenv(k) or "").strip() for k in proxy_vars)
-    if not has_proxy:
-        return
-
-    from urllib.parse import urlparse
-    host = ""
-    try:
-        host = (urlparse(url).hostname or "").strip()
-    except Exception:
-        host = ""
-    if not host:
-        return
-
-    def _append_no_proxy(*extra_hosts: str) -> None:
-        to_add = [h for h in (host, *extra_hosts) if h and str(h).strip()]
-
-        if "deepseek.com" in host:
-            for h in ("deepseek.com", "*.deepseek.com"):
-                if h not in to_add:
-                    to_add.append(h)
-
-        if "aihubmix.com" in host:
-            for h in ("aihubmix.com", "*.aihubmix.com"):
-                if h not in to_add:
-                    to_add.append(h)
-        for env_key in ("NO_PROXY", "no_proxy"):
-            cur = str(os.getenv(env_key) or "").strip()
-            parts = [p.strip() for p in cur.split(",") if p.strip()]
-            seen = {p.lower() for p in parts}
-            for h in to_add:
-                hl = h.lower()
-                if hl not in seen:
-                    parts.append(h)
-                    seen.add(hl)
-            os.environ[env_key] = ",".join(parts)
-
-    if disable:
-        for k in proxy_vars:
-            os.environ.pop(k, None)
-        _append_no_proxy()
-        return
-
-    _append_no_proxy()
-
 def is_llm_configured() -> bool:
-    s = get_settings()
-    key = (os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or s.openai_api_key or "").strip()
-    if not key:
+    settings = get_settings()
+    return bool(os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("AIHUBMIX_API_KEY") or settings.openai_api_key)
 
-        from dotenv import load_dotenv
-        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=True)
-            key = (os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-    return bool(key)
-
-def _sync_env_from_settings() -> None:
-    s = get_settings()
-
-    if not os.getenv("LLM_API_KEY") and not os.getenv("OPENAI_API_KEY") and os.getenv("AIHUBMIX_API_KEY"):
-        os.environ["LLM_API_KEY"] = str(os.getenv("AIHUBMIX_API_KEY") or "").strip()
-    if not os.getenv("LLM_BASE_URL") and not os.getenv("OPENAI_BASE_URL") and os.getenv("AIHUBMIX_BASE_URL"):
-        os.environ["LLM_BASE_URL"] = str(os.getenv("AIHUBMIX_BASE_URL") or "").strip()
-    if not os.getenv("LLM_MODEL_ID") and not os.getenv("OPENAI_MODEL") and os.getenv("AIHUBMIX_MODEL_ID"):
-        os.environ["LLM_MODEL_ID"] = str(os.getenv("AIHUBMIX_MODEL_ID") or "").strip()
-
-    if not os.getenv("LLM_API_KEY") and not os.getenv("OPENAI_API_KEY") and s.openai_api_key:
-        os.environ["LLM_API_KEY"] = s.openai_api_key
-    if not os.getenv("LLM_BASE_URL") and not os.getenv("OPENAI_BASE_URL") and s.openai_base_url:
-        os.environ["LLM_BASE_URL"] = s.openai_base_url
-    if not os.getenv("LLM_MODEL_ID") and not os.getenv("OPENAI_MODEL") and s.openai_model:
-        os.environ["LLM_MODEL_ID"] = s.openai_model
 
 def get_llm() -> HelloAgentsLLM:
     global _llm_instance
-    if _llm_instance is None:
+    with _llm_lock:
+        if _llm_instance is None:
+            settings = get_settings()
+            key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("AIHUBMIX_API_KEY") or settings.openai_api_key
+            if not key:
+                raise RuntimeError("LLM 未配置：请设置 LLM_API_KEY")
+            model = os.getenv("LLM_MODEL_ID") or os.getenv("OPENAI_MODEL") or os.getenv("AIHUBMIX_MODEL_ID") or settings.openai_model
+            base = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("AIHUBMIX_BASE_URL") or settings.openai_base_url
+            _llm_instance = PaperGraphLLM(api_key=key, model=model, base_url=base, timeout=settings.agent_runtime_default_timeout_sec)
+            # OpenAI 兼容客户端使用独立 HTTP 配置，不删除进程的代理环境变量。
+            from hello_agents.core.llm_adapters import OpenAIAdapter
+            if isinstance(_llm_instance._adapter, OpenAIAdapter):
+                import httpx
+                from openai import OpenAI, AsyncOpenAI
+                trust = settings.papergraph_httpx_trust_env and not settings.llm_disable_proxy
+                _llm_instance._adapter._client = OpenAI(api_key=key, base_url=base, timeout=_llm_instance.timeout, max_retries=0, http_client=httpx.Client(trust_env=trust))
+                _llm_instance._adapter._async_client = AsyncOpenAI(api_key=key, base_url=base, timeout=_llm_instance.timeout, max_retries=0, http_client=httpx.AsyncClient(trust_env=trust))
+            logger.info("LLM initialized model=%s", model)
+        return _llm_instance
 
-        _sync_env_from_settings()
 
-        api_key = (os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "")
-        base_url = (os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "")
-        model = (os.getenv("LLM_MODEL_ID") or os.getenv("OPENAI_MODEL") or "")
-
-        if not api_key:
-            s = get_settings()
-            api_key = s.openai_api_key
-            if not base_url:
-                base_url = s.openai_base_url
-            if not model:
-                model = s.openai_model
-
-        if not api_key:
-            raise RuntimeError("LLM 未配置：请设置 LLM_API_KEY（或在 backend/.env 中配置）")
-
-        _maybe_disable_proxy_for_llm(base_url)
-
-        kw = {}
-        if model:
-            kw["model"] = model
-        if api_key:
-            kw["api_key"] = api_key
-        if base_url:
-            kw["base_url"] = base_url
-
-        logger.info("🔧 正在初始化 LLM...")
-        logger.info("   Model: %s", model or "default")
-        logger.info("   Base URL: %s", base_url or "default")
-
-        _llm_instance = HelloAgentsLLM(**kw)
-        logger.info("✅ LLM 已初始化")
-        logger.info("   实际模型: %s", getattr(_llm_instance, "model", "") or "unknown")
-
-        logger.info("   Provider: %s", getattr(_llm_instance, "provider", None) or "unknown")
-    return _llm_instance
+async def close_llm() -> None:
+    global _llm_instance
+    with _llm_lock:
+        llm, _llm_instance = _llm_instance, None
+    if llm is None:
+        return
+    for attribute in ("_client", "_async_client"):
+        client = getattr(llm._adapter, attribute, None)
+        if client is not None:
+            result = client.close()
+            if hasattr(result, "__await__"):
+                await result

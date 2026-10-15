@@ -56,7 +56,7 @@ class ResolvedSearchPlan:
             target_titles=list(getattr(intent, "target_titles", []) or [])[:6],
             arxiv_id_list=list(getattr(intent, "arxiv_id_list", []) or [])[:16],
             main_conference_proceedings_only=bool(getattr(intent, "main_conference_proceedings_only", False)),
-            raw_user_message=(getattr(intent, "raw_user_message", "") or "")[:3200],
+            raw_user_message=(getattr(intent, "raw_user_message", "") or ""),
             wants_recent=bool(getattr(intent, "wants_recent", False)),
             wants_classic=bool(getattr(intent, "wants_classic", False)),
             use_tavily=_resolve_use_tavily(intent),

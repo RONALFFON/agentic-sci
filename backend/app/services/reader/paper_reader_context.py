@@ -7,6 +7,8 @@ import re
 import sqlite3
 import time
 from typing import Any
+from ..llm.agent_runtime import check_active
+from ..task_state import file_version, task_lock, identity
 
 def extract_pdf_text_full(abspath: str | None) -> str:
     if not abspath or not os.path.isfile(abspath):
@@ -212,6 +214,8 @@ def reference_strings_for_resolve_fallback(section_raw: str, *, max_strings: int
     return out[:max_strings]
 
 def _ensure_cache_table(conn: sqlite3.Connection) -> None:
+    check_active()
+    conn.execute("BEGIN IMMEDIATE")
     cur = conn.cursor()
     cur.execute(
         """
@@ -241,7 +245,7 @@ def _ensure_cache_table(conn: sqlite3.Connection) -> None:
 def _pdf_stat(abspath: str) -> tuple[int, int | None]:
     try:
         st = os.stat(abspath)
-        return int(st.st_mtime), int(st.st_size)
+        return int(st.st_mtime_ns), int(st.st_size)
     except Exception:
         return None
 
@@ -259,7 +263,7 @@ def _cache_get(db_path: str, paper_id: int, pdf_abspath: str, max_age_days: int 
         cur = conn.cursor()
         _ensure_cache_table(conn)
         cur.execute(
-            "SELECT pdf_mtime,pdf_size,excerpt,updated_at FROM paper_pdf_excerpt_cache WHERE paper_id=?",
+            "SELECT pdf_mtime,pdf_size,excerpt,updated_at,pdf_abspath FROM paper_pdf_excerpt_cache WHERE paper_id=?",
             (int(paper_id),),
         )
         row = cur.fetchone()
@@ -270,7 +274,7 @@ def _cache_get(db_path: str, paper_id: int, pdf_abspath: str, max_age_days: int 
             )
             conn.commit()
             return None
-        ok = int(row[0] or 0) == mtime and int(row[1] or 0) == size
+        ok = int(row[0] or 0) == mtime and int(row[1] or 0) == size and os.path.normcase(os.path.abspath(row[4] or ".")) == os.path.normcase(os.path.abspath(pdf_abspath))
         ex = (row[2] or "").strip()
         updated_at = int(row[3] or 0)
         expired = bool(updated_at and max_age_days > 0 and (now - updated_at) > max_age_days * 86400)
@@ -295,6 +299,7 @@ def _cache_get(db_path: str, paper_id: int, pdf_abspath: str, max_age_days: int 
             conn.close()
 
 def _cache_set(db_path: str, paper_id: int, pdf_abspath: str, excerpt: str) -> None:
+    check_active()
     if not db_path or not pdf_abspath:
         return
     st = _pdf_stat(pdf_abspath)
@@ -347,12 +352,18 @@ def _cache_delete(db_path: str, paper_id: int) -> None:
         pass
 
 def compute_and_cache_excerpt(db_path: str, paper_id: int, pdf_abspath: str) -> None:
-    ex = extract_pdf_text_full(pdf_abspath)
-    if ex.strip():
-        _cache_set(db_path, int(paper_id), pdf_abspath, ex)
-    else:
+    with task_lock(identity("pdf-excerpt", db_path, paper_id)):
+        version = file_version(pdf_abspath)
+        cached, hit = extract_pdf_text_full_cached(db_path, paper_id, pdf_abspath)
+        if hit:
+            return
+        ex = extract_pdf_text_full(pdf_abspath)
+        check_active()
+        if file_version(pdf_abspath) != version:
+            return
+        if ex.strip():
+            _cache_set(db_path, int(paper_id), pdf_abspath, ex)
 
-        _cache_delete(db_path, int(paper_id))
 
 def _ensure_reader_pdf_available(db: Any, paper: Any) -> str | None:
     """阅读页兜底：库内无 PDF 但有 arXiv/pdf_url 时，现取现存一份供上下文解析。"""

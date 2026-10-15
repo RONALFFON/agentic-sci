@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import time
+import asyncio
+from ..services.llm.agent_runtime import request_id
 from contextlib import contextmanager
 from typing import Any, Iterator, List, Optional
 
@@ -34,17 +38,23 @@ def track_tool_call(
     name: str,
     params: Optional[dict[str, Any]] = None,
 ) -> Iterator[ToolCallInfo]:
+    started = time.monotonic()
     tc = ToolCallInfo(name=name, status="running", params=params)
     tool_calls.append(tc)
     try:
         yield tc
         if tc.status == "running":
             tc.status = "success"
+    except asyncio.CancelledError:
+        tc.status = "cancelled"
+        raise
     except Exception as e:
-        tc.status = "error"
+        tc.status = "timeout" if isinstance(e, TimeoutError) else "error"
         if not tc.result_summary:
             tc.result_summary = f"执行失败: {str(e)[:120]}"
         raise
+    finally:
+        logging.getLogger(__name__).info("tool_call request_id=%s task=%s status=%s duration_ms=%d", request_id(), name, tc.status, (time.monotonic() - started)*1000)
 
 
 def normalize_tool_calls(tool_calls: List[Any]) -> List[ToolCallInfo]:

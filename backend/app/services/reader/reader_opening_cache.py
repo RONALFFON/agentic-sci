@@ -5,34 +5,44 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from ..llm.agent_runtime import check_active
 
 @contextmanager
 def _conn(db_path: str):
     conn = sqlite3.connect(db_path)
     try:
         yield conn
+        check_active()
         conn.commit()
     finally:
         conn.close()
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
+    check_active()
+    conn.execute("BEGIN IMMEDIATE")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS paper_opening_cache(paper_id INTEGER PRIMARY KEY,opening TEXT,updated_at INTEGER,hit_count INTEGER DEFAULT 0,miss_count INTEGER DEFAULT 0,last_hit_at INTEGER,last_miss_at INTEGER)"
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_opening_cache)")}
+    if "content_version" not in columns:
+        conn.execute("ALTER TABLE paper_opening_cache ADD COLUMN content_version TEXT")
 
-def get_cached_opening(db_path: str, paper_id: int, max_age_hours: int = 72) -> tuple[str | None, bool]:
+
+def get_cached_opening(db_path: str, paper_id: int, max_age_hours: int = 72, content_version: str | None = None) -> tuple[str | None, bool]:
     if not db_path:
         return None, False
     now = int(time.time())
     try:
         with _conn(db_path) as conn:
             _ensure_table(conn)
-            row = conn.execute("SELECT opening,updated_at FROM paper_opening_cache WHERE paper_id=?", (int(paper_id),)).fetchone()
+            row = conn.execute("SELECT opening,updated_at,content_version FROM paper_opening_cache WHERE paper_id=?", (int(paper_id),)).fetchone()
             if not row:
                 conn.execute(
                     "INSERT OR IGNORE INTO paper_opening_cache(paper_id,opening,updated_at,miss_count,last_miss_at) VALUES(?,?,?,?,?)",
                     (int(paper_id), "", 0, 1, now),
                 )
+                return None, False
+            if content_version is not None and row[2] != content_version:
                 return None, False
             opening = (row[0] or "").strip()
             updated_at = int(row[1] or 0)
@@ -51,7 +61,7 @@ def get_cached_opening(db_path: str, paper_id: int, max_age_hours: int = 72) -> 
     except Exception:
         return None, False
 
-def set_cached_opening(db_path: str, paper_id: int, opening: str) -> None:
+def set_cached_opening(db_path: str, paper_id: int, opening: str, content_version: str | None = None) -> None:
     if not db_path:
         return
     now = int(time.time())
@@ -59,8 +69,8 @@ def set_cached_opening(db_path: str, paper_id: int, opening: str) -> None:
         with _conn(db_path) as conn:
             _ensure_table(conn)
             conn.execute(
-                "INSERT INTO paper_opening_cache(paper_id,opening,updated_at) VALUES(?,?,?) ON CONFLICT(paper_id) DO UPDATE SET opening=excluded.opening,updated_at=excluded.updated_at",
-                (int(paper_id), str(opening or "").strip(), now),
+                "INSERT INTO paper_opening_cache(paper_id,opening,updated_at,content_version) VALUES(?,?,?,?) ON CONFLICT(paper_id) DO UPDATE SET opening=excluded.opening,updated_at=excluded.updated_at,content_version=excluded.content_version",
+                (int(paper_id), str(opening or "").strip(), now, content_version),
             )
     except Exception:
         return

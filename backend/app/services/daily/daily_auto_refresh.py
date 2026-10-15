@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 import logging
 import time
 from typing import TYPE_CHECKING
 
 from ...settings import get_settings
+from ..task_state import today_key
+from ..llm.agent_runtime import execution_scope
 import contextlib
 
 if TYPE_CHECKING:
@@ -73,7 +76,6 @@ async def daily_auto_refresh_loop(app: FastAPI) -> None:
             return False
 
     lock = get_daily_compute_lock()
-    date_key = _dt.datetime.now().strftime("%Y-%m-%d")
 
     while True:
         try:
@@ -81,6 +83,7 @@ async def daily_auto_refresh_loop(app: FastAPI) -> None:
             ts = getattr(app.state, "last_meaningful_activity_monotonic", None)
             if ts is not None and time.monotonic() - ts < idle:
                 continue
+            date_key = today_key()
             db_path = get_db_path()
             if _cache_nonempty(await run_in_threadpool(get_cache, db_path, date_key=date_key, cache_key='default')):
                 continue
@@ -97,13 +100,14 @@ async def daily_auto_refresh_loop(app: FastAPI) -> None:
                 from ...services.papers import papers_converters
                 body = DailyPapersRequest(force_refresh=False)
                 logger.info("每日论文：后台自动拉取开始（当日无有效缓存且系统空闲）")
-                await compute_daily(
-                    body=body, db_path=db_path, searcher=get_searcher(),
-                    daily_paper_identity_sig_fn=daily_paper_identity_sig,
-                    daily_arxiv_cs_categories=settings.get_daily_arxiv_cs_categories(),
-                    papergraph_to_api_fn=papers_converters.litpaper_to_api_paper,
-                    logger=logger,
-                )
+                with execution_scope(settings.agent_request_timeout_sec, independent=True) as budget, anyio.fail_after(budget.remaining()):
+                    await compute_daily(
+                        body=body, db_path=db_path, searcher=get_searcher(),
+                        daily_paper_identity_sig_fn=daily_paper_identity_sig,
+                        daily_arxiv_cs_categories=settings.get_daily_arxiv_cs_categories(),
+                        papergraph_to_api_fn=papers_converters.litpaper_to_api_paper,
+                        logger=logger,
+                    )
                 logger.info("每日论文：后台自动拉取完成")
         except asyncio.CancelledError:
             logger.info("每日论文后台自动刷新任务已取消")

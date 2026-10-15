@@ -5,6 +5,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 python-multipart>=0.0.6
 python-dotenv>=1.0.0
+tzdata>=2024.1
 
 # HTTP / search API
 requests>=2.31.0
@@ -15,7 +16,7 @@ feedparser>=6.0.10
 anyio>=4.0.0
 
 # AI/Agent framework
-hello-agents>=1.0.0
+hello-agents==1.0.0
 
 # PDF text extraction
 pymupdf>=1.24.0

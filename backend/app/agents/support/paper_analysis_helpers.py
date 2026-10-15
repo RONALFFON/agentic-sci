@@ -20,6 +20,32 @@ def clip_text(text: str | None, n: int) -> str:
             t = t[:-1]
     return t
 
+
+def build_reader_prompt(question: str, context: str, history: str, memory: str, *, model: str = "gpt-4", max_tokens: int = 12000) -> str:
+    """先保留完整问题，再为资料、历史和偏好分配 token 预算。"""
+    from hello_agents.context.token_counter import TokenCounter
+    counter = TokenCounter(model=model)
+    head = "【用户最新问题】\n" + question.strip() + "\n\n"
+    if counter.count_text(head) > max_tokens - 100:
+        raise ValueError("问题超过阅读上下文预算，请缩短后重试")
+    result = head
+    for label, text, cap in (("当前文献材料", context, 4200), ("对话历史", history, 2200), ("研究偏好（不是论文事实证据）", memory, 700)):
+        available = min(cap, max_tokens - counter.count_text(result) - 50)
+        if available <= 0:
+            break
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if counter.count_text(text[:mid]) <= available:
+                low = mid
+            else:
+                high = mid - 1
+        excerpt = text[:low]
+        if low < len(text):
+            excerpt += "\n（材料已截断，可调用工具读取相关章节）"
+        result += f"【{label}】\n{excerpt}\n\n"
+    return result
+
 def dedupe_tags(tags: list[str], max_tags: int = 12) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()

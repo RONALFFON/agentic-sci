@@ -34,6 +34,10 @@ async def paper_reader_opening(
     try:
         result = await service.get_opening(paper_id=int(body.paper_id), background_tasks=background_tasks)
         return PaperReaderOpeningResponse(success=True, **result)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="阅读处理超时，请稍后重试") from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
@@ -61,6 +65,10 @@ async def paper_reader_chat(
             related_hints=list(out.get("related_hints") or []),
             kg_edges=list(out.get("kg_edges") or []),
         )
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="阅读处理超时，请稍后重试") from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
@@ -79,6 +87,10 @@ async def paper_reader_history(
             paper_id=int(paper_id),
             turns=[PaperReaderHistoryItem(**t) for t in turns],
         )
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="阅读处理超时，请稍后重试") from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:

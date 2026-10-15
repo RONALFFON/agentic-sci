@@ -11,6 +11,7 @@ from ...agents.support.reader_reference_lookup_tool import (
     prioritize_reader_related_pairs_refs_first,
 )
 from ...utils import parse_llm_json, truncate_text
+from ..llm.structured_output import ReferenceQueries, ReaderRanking, valid_indices
 from ..llm.llm_service import coerce_hello_agents_llm_output_to_str, get_llm, is_llm_configured
 from .paper_reader_context import preprocess_pdf_text_for_reference_blob
 
@@ -60,8 +61,9 @@ def extract_title_queries_from_ref_blob_llm(
     data = parse_llm_json(text)
     if not isinstance(data, dict):
         return []
-    arr = data.get("queries") or data.get("title_queries") or []
-    if not isinstance(arr, list):
+    try:
+        arr = ReferenceQueries.model_validate({"queries": data.get("queries", data.get("title_queries", []))}).queries
+    except ValueError:
         return []
     out: list[str] = []
     seen: set[str] = set()
@@ -74,10 +76,8 @@ def extract_title_queries_from_ref_blob_llm(
         _nr = re.sub(r"\s+", " ", preprocess_pdf_text_for_reference_blob(section_raw or "").lower()).strip()
         if len(_nq) < 12 or len(_nr) < 40:
             continue
-        if not (_nq in _nr or (len(_nq[:48]) >= 14 and _nq[:48] in _nr)):
-            _words = [w for w in re.findall(r"[a-z]{5,}", _nq) if len(w) >= 5][:8]
-            if not _words or sum(1 for w in _words if w in _nr) < max(2, int(len(_words) * 0.5)):
-                continue
+        if _nq not in _nr:
+            continue
         k = q.lower()[:240]
         if k in seen:
             continue
@@ -184,24 +184,9 @@ def rerank_reader_recommend_pairs_by_llm(
         )
         text = coerce_hello_agents_llm_output_to_str(raw).strip()
         data = parse_llm_json(text)
-        if isinstance(data, dict):
-            if isinstance(data.get("order"), list):
-                parsed: list[int] = []
-                for x in data["order"]:
-                    try:
-                        parsed.append(int(x))
-                    except (TypeError, ValueError):
-                        continue
-                order = parsed
-            for key in ("keep_n", "keep", "n_keep", "num_keep"):
-                v = data.get(key)
-                if v is None:
-                    continue
-                try:
-                    keep_n = int(v)
-                    break
-                except (TypeError, ValueError):
-                    continue
+        parsed = ReaderRanking.model_validate(data)
+        order = valid_indices(parsed.order, n, n)
+        keep_n = min(parsed.keep_n, n, READER_RECOMMEND_MAX_RESULTS)
     except Exception as exc:
         logger.debug("rerank_reader_recommend_llm_invoke_failed", exc_info=exc)
 

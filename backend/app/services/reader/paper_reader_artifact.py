@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from uuid import uuid4
+from ..llm.agent_runtime import check_active
+from ..task_state import task_lock, identity
 from typing import Any
 
 from .paper_reader_structure import parse_pdf_merged_text_to_json
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 ARTIFACT_DIR = "reader_artifacts"
 
 
@@ -23,7 +26,7 @@ def _pdf_stat(pdf_abspath: str | None) -> dict[str, int]:
         return {}
     try:
         st = os.stat(pdf_abspath)
-        return {"mtime": int(st.st_mtime), "size": int(st.st_size)}
+        return {"mtime": int(st.st_mtime_ns), "size": int(st.st_size), "path": os.path.normcase(os.path.abspath(pdf_abspath))}
     except Exception:
         return {}
 
@@ -60,7 +63,7 @@ def load_reader_artifact(db_path: str, paper_id: int, pdf_abspath: str | None = 
         return None
     current = _pdf_stat(pdf_abspath)
     saved = obj.get("pdf") or {}
-    if current and (int(saved.get("mtime") or 0) != current["mtime"] or int(saved.get("size") or 0) != current["size"]):
+    if saved != current:
         return None
     return obj
 
@@ -76,20 +79,25 @@ def build_reader_artifact(
     if len(text) < 200:
         return None
 
+    original_pdf = _pdf_stat(pdf_abspath)
     parsed = parse_pdf_merged_text_to_json(text, max_chapter_chars=9000, max_chapters=40, max_ref_entries=100)
     artifact = {
         "version": ARTIFACT_VERSION,
         "generated_at": int(time.time()),
         "paper": _paper_meta(paper),
-        "pdf": _pdf_stat(pdf_abspath),
+        "pdf": original_pdf,
         "structure": parsed,
     }
     path = reader_artifact_path(db_path, paper_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
+        tmp = path + "." + uuid4().hex + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(artifact, f, ensure_ascii=False, indent=2)
+        check_active()
+        if _pdf_stat(pdf_abspath) != original_pdf:
+            os.remove(tmp)
+            return None
         os.replace(tmp, path)
     except Exception:
         return None
@@ -103,10 +111,11 @@ def ensure_reader_artifact(
     pdf_text: str,
     pdf_abspath: str | None = None,
 ) -> dict[str, Any] | None:
-    cached = load_reader_artifact(db_path, paper_id, pdf_abspath)
-    if cached:
-        return cached
-    return build_reader_artifact(db_path, paper_id, paper, pdf_text, pdf_abspath)
+    with task_lock(identity("reader-artifact", db_path, paper_id)):
+        cached = load_reader_artifact(db_path, paper_id, pdf_abspath)
+        if cached and cached.get("paper") == _paper_meta(paper):
+            return cached
+        return build_reader_artifact(db_path, paper_id, paper, pdf_text, pdf_abspath)
 
 
 def format_reader_artifact_block(artifact: dict[str, Any] | None, *, max_chars: int = 9000) -> str:

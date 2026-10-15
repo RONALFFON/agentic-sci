@@ -17,10 +17,11 @@ improves > extends > uses > compares > surveys > references > dataset_overlap > 
 
 ## Rules
 - 不确定不输出；禁常识/语义相似/venue推测/embedding相似推测。
-- evidence≤80字；须含来源位置+动作+对象；禁笼统句。
+- evidence≤240字；须含来源位置+动作+对象；禁笼统句。
+- evidence_location 填 abstract 或正文实际章节；evidence_quote 填输入材料中的连续原文引句。强关系与 references 必须提供可在输入中核对的原文引句，不能翻译或改写引句。
 - score<0.55不输出。锚点：0.55-0.65弱/overlap；0.65-0.8明确提及；0.8-1.0深度继承。无显式锚点≤0.7。
 - 弱边数≤强边数；同簇多弱边只留最优。
 
 ## Output Format
-{"edges":[{"target_paper_id":123,"relation":"extends|improves|uses|compares|surveys|references|task_overlap|method_overlap|dataset_overlap","score":0.0,"evidence":""}]}
+{"edges":[{"target_paper_id":123,"relation":"extends|improves|uses|compares|surveys|references|task_overlap|method_overlap|dataset_overlap","score":0.0,"evidence":"", "evidence_location":"abstract", "evidence_quote":"输入材料的原文引句"}]}
 """

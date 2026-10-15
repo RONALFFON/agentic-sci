@@ -334,10 +334,11 @@ def delete_paper(paper_id: int, db=Depends(get_database)):
 @router.post("/daily/feedback", response_model=DailyRecommendFeedbackResponse)
 async def record_daily_recommend_feedback(
     body: DailyRecommendFeedbackRequest,
+    background_tasks: BackgroundTasks,
     db_path=Depends(get_db_path),
 ):
     try:
-        return await record_daily_feedback_service(body=body, db_path=db_path)
+        return await record_daily_feedback_service(body=body, db_path=db_path, background_tasks=background_tasks)
     except HTTPException:
         raise
     except Exception as e:

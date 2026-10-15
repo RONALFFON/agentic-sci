@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from ...settings import get_settings
+from ..llm.agent_runtime import check_active
 
 
-SEARCH_CACHE_VERSION = "search-result-v1"
+SEARCH_CACHE_VERSION = "search-result-v2"
 
 
 def _norm_text(value: Any) -> str:
@@ -91,6 +92,7 @@ class SearchResultCache:
                 "CREATE INDEX IF NOT EXISTS idx_search_cache_expiry "
                 "ON search_result_cache(expires_at, created_at)"
             )
+            check_active()
             conn.commit()
         finally:
             conn.close()
@@ -106,6 +108,9 @@ class SearchResultCache:
         identity = {
             "cache_version": SEARCH_CACHE_VERSION,
             "model": _norm_text(model),
+            "provider": os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or settings.openai_base_url,
+            "main_conference_proceedings_only": bool(getattr(plan, "main_conference_proceedings_only", False)),
+            "method_acronym": getattr(plan, "method_acronym", None),
             "mode": _norm_text(mode or "accuracy"),
             "use_tavily_request": bool(use_tavily),
             "query": _norm_text(getattr(plan, "query", "")),
@@ -144,6 +149,7 @@ class SearchResultCache:
                 return None
             if int(row["expires_at"] or 0) <= now:
                 conn.execute("DELETE FROM search_result_cache WHERE cache_key = ?", (str(cache_key),))
+                check_active()
                 conn.commit()
                 return None
             try:
@@ -157,6 +163,7 @@ class SearchResultCache:
                 "WHERE cache_key = ?",
                 (now, str(cache_key)),
             )
+            check_active()
             conn.commit()
             return payload
         finally:
@@ -200,6 +207,7 @@ class SearchResultCache:
                     "DELETE FROM search_result_cache WHERE cache_key = ?",
                     [(str(row["cache_key"]),) for row in old_keys],
                 )
+            check_active()
             conn.commit()
             return True
         finally:
@@ -210,6 +218,7 @@ class SearchResultCache:
         conn = self._connect()
         try:
             conn.execute("DELETE FROM search_result_cache")
+            check_active()
             conn.commit()
         finally:
             conn.close()

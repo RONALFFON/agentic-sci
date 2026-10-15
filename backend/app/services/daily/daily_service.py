@@ -11,11 +11,14 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
+from ..llm.agent_runtime import run_sync, execution_scope, check_active
+from ..llm.structured_output import parse_json, DailySelection, ThemeKeywords, valid_indices
+from ..task_state import today_key
 
 from ...agents import get_search_agent
 from ...core.storage import PaperDatabase
 from ...models.schemas import DailyPapersRequest, DailyPapersResponse
-from ..daily.daily_cache_store import get_cache, set_cache
+from ..daily.daily_cache_store import get_cache, set_cache, get_revision
 from ..daily.daily_recommend_store import record_arxiv_recommendations
 from ..daily.daily_recommend_feedback import record_feedback
 from ..daily.daily_support import (
@@ -52,6 +55,10 @@ def _select_personalized_and_general(
         for p in external_unique or []:
             if _identity(p) not in skip_sigs:
                 pool.append(p)
+    unique_pool = {}
+    for paper in pool:
+        unique_pool.setdefault(_identity(paper), paper)
+    pool = list(unique_pool.values())[:120]
     if not pool:
         return [], []
 
@@ -80,6 +87,7 @@ def _select_personalized_and_general(
                     "task": f"Select {personalized_k} personalized and {general_k} exploration papers",
                     "interests": pref_keywords,
                     "candidates": papers_info,
+                    "output_format": {"personalized": [0], "general": [1]},
                 },
                 ensure_ascii=False,
             )
@@ -87,15 +95,17 @@ def _select_personalized_and_general(
             raw = coerce_hello_agents_llm_output_to_str(
                 get_llm().invoke([{"role": "user", "content": prompt}], temperature=pick_temp, max_tokens=400)
             )
-            data = json.loads(raw.strip().lstrip("```json").rstrip("```").strip())
-            llm_p = [int(i) for i in (data.get("personalized") or [])[:personalized_k] if 0 <= int(i) < len(pool)]
-            llm_g = [
-                int(i)
-                for i in (data.get("general") or [])[:general_k]
-                if 0 <= int(i) < len(pool) and int(i) not in llm_p
-            ]
-            if llm_p or llm_g:
-                p_idxs, g_idxs = llm_p, llm_g
+            data = DailySelection.model_validate(parse_json(raw))
+            llm_p = valid_indices(data.personalized, len(pool), personalized_k)
+            llm_g = valid_indices(data.general, len(pool), general_k, excluded=llm_p)
+            # 不足部分使用尚未选过的候选补齐，不把空列表当作完整成功输出。
+            for index in range(len(pool)):
+                if index not in llm_p and index not in llm_g:
+                    if len(llm_p) < personalized_k:
+                        llm_p.append(index)
+                    elif len(llm_g) < general_k:
+                        llm_g.append(index)
+            p_idxs, g_idxs = llm_p, llm_g
     except Exception:
         pass
     return [pool[i] for i in p_idxs], [pool[i] for i in g_idxs]
@@ -136,7 +146,7 @@ def titles_for_daily_theme_prompt(papers: list[Any]) -> list[str]:
         if not t:
             continue
         if len(t) > _TITLE_MAX_CHARS:
-            t = t[: _TITLE_MAX_CHARS - 1] + "\u2026"
+            t = t[: _TITLE_MAX_CHARS - 1] + "…"
         out.append(t)
     return out
 
@@ -178,23 +188,23 @@ def summarize_daily_theme_keywords_sync(
         logger.warning("daily_theme_keywords: llm init failed: %s", e)
         return [], []
 
-    lines_p = "\n".join(f"- {t}" for t in personalized_titles) or "\uff08\u65e0\uff09"
-    lines_g = "\n".join(f"- {t}" for t in general_titles) or "\uff08\u65e0\uff09"
-    prompt = f"""\u4f60\u662f\u5b66\u672f\u6587\u732e\u63a8\u8350\u4ea7\u54c1\u7684\u6587\u6848\u52a9\u624b\u3002\u4e0b\u9762\u4e24\u7ec4\u6807\u9898\u5206\u522b\u6765\u81ea\u300c\u4e2a\u6027\u5316\u63a8\u8350\u300d\u4e0e\u300c\u5f53\u65e5\u7cbe\u9009\uff08\u968f\u673a\u63a2\u7d22\uff09\u300d\u4e24\u680f\u8bba\u6587\u3002
+    lines_p = "\n".join(f"- {t}" for t in personalized_titles) or "（无）"
+    lines_g = "\n".join(f"- {t}" for t in general_titles) or "（无）"
+    prompt = f"""你是学术文献推荐产品的文案助手。下面两组标题分别来自「个性化推荐」与「当日精选（随机探索）」两栏论文。
 
-\u3010\u4e2a\u6027\u5316\u63a8\u8350\u3011\u9898\u540d\uff1a
+【个性化推荐】题名：
 {lines_p}
 
-\u3010\u5f53\u65e5\u7cbe\u9009\u3011\u9898\u540d\uff1a
+【当日精选】题名：
 {lines_g}
 
-\u8bf7\u4e3a\u6bcf\u4e00\u7ec4\u5404\u63d0\u70bc\u4e0d\u8d85\u8fc7 {max_each} \u4e2a\u300c\u4e3b\u9898\u6807\u7b7e\u300d\uff0c\u7528\u4e8e\u754c\u9762\u6807\u7b7e\u5c55\u793a\u3002
-\u89c4\u5219\uff1a
-1. \u6bcf\u4e2a\u6807\u7b7e 2\uff5e14 \u4e2a\u6c49\u5b57\u6216\u76f8\u5f53\u957f\u5ea6\uff1b\u53ef\u542b\u5fc5\u8981\u82f1\u6587\u7f29\u7565\u8bcd\uff08\u5982 LLM\u3001RL\u3001GNN\uff09\uff1b\u4e0d\u8981\u6574\u53e5\u590d\u5236\u539f\u6807\u9898\u3002
-2. \u6982\u62ec\u8be5\u7ec4\u5171\u540c\u7684\u7814\u7a76\u65b9\u5411\u6216\u65b9\u6cd5\uff1b\u7ec4\u5185\u6807\u7b7e\u5c3d\u91cf\u4e0d\u91cd\u590d\u3002
-3. \u53ea\u8f93\u51fa\u4e00\u6bb5\u4e25\u683c JSON\uff08\u4e0d\u8981 markdown \u56f4\u680f\u3001\u4e0d\u8981\u524d\u540e\u8bf4\u660e\uff09\uff0c\u683c\u5f0f\u56fa\u5b9a\u4e3a\uff1a
-{{\\"personalized\\":[\\"\u2026\\"],\\"general\\":[\\"\u2026\\"]}}
-\u952e\u540d\u5fc5\u987b\u4e3a\u82f1\u6587\uff1b\u82e5\u67d0\u7ec4\u65e0\u6709\u6548\u6807\u9898\u5219\u5bf9\u5e94\u6570\u7ec4\u4e3a []\u3002"""
+请为每一组各提炼不超过 {max_each} 个「主题标签」，用于界面标签展示。
+规则：
+1. 每个标签 2～14 个汉字或相当长度；可含必要英文缩略词（如 LLM、RL、GNN）；不要整句复制原标题。
+2. 概括该组共同的研究方向或方法；组内标签尽量不重复。
+3. 只输出一段严格 JSON（不要 markdown 围栏、不要前后说明），格式固定为：
+{{"personalized":["…"],"general":["…"]}}
+键名必须为英文；若某组无有效标题则对应数组为 []。"""
     try:
         raw = coerce_hello_agents_llm_output_to_str(
             llm.invoke([{"role": "user", "content": prompt}], temperature=0.15, max_tokens=420)
@@ -204,9 +214,9 @@ def summarize_daily_theme_keywords_sync(
         return [], []
 
     try:
-        data = json.loads(_strip_json_fence(raw))
-    except json.JSONDecodeError:
-        logger.warning("daily_theme_keywords: json parse failed, head=%r", (raw or "")[:240])
+        data = ThemeKeywords.model_validate(parse_json(raw)).model_dump()
+    except ValueError:
+        logger.warning("daily_theme_keywords: invalid output")
         return [], []
     if not isinstance(data, dict):
         return [], []
@@ -220,17 +230,7 @@ def _build_strategy_explanation(
     *, agent: Any, n_personalized: int, n_general: int, n_candidates: int, n_memory_kw: int,
 ) -> str:
     fallback = f"个性化{n_personalized}篇 · 通用{n_general}篇 · 候选{n_candidates}篇"
-    if not is_llm_configured():
-        return fallback
-    prompt = (
-        f"用一句话中文概括今日论文推荐策略：个性化{n_personalized}篇、通用{n_general}篇，"
-        f"候选池{n_candidates}篇，记忆词{n_memory_kw}条参与"
-    )
-    try:
-        raw = agent.llm.invoke([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=80)
-        return coerce_hello_agents_llm_output_to_str(raw).strip()[:200]
-    except Exception:
-        return fallback
+    return fallback + (f" · 兴趣词 {n_memory_kw} 条" if n_memory_kw else "")
 
 
 def _build_pick_hints(personalized_final, general_selected, _identity):
@@ -262,6 +262,7 @@ async def _build_daily_response(
     daily_paper_identity_sig_fn,
     papergraph_to_api_fn,
     db_path,
+    cache_revision,
 ) -> DailyPapersResponse:
     _to_api = papergraph_to_api_fn
     _identity = daily_paper_identity_sig_fn
@@ -278,7 +279,7 @@ async def _build_daily_response(
     g_theme: list[str] = []
     if use_llm_theme_keywords:
         try:
-            p_theme, g_theme = await run_in_threadpool(
+            p_theme, g_theme = await run_sync(
                 summarize_daily_theme_keywords_sync,
                 personalized_titles=titles_for_daily_theme_prompt(personalized_final),
                 general_titles=titles_for_daily_theme_prompt(general_selected),
@@ -326,7 +327,7 @@ async def _build_daily_response(
 
     try:
         await run_in_threadpool(
-            set_cache, db_path, date_key=date_key, cache_key="default", payload=resp.model_dump(mode="json")
+            set_cache, db_path, date_key=date_key, cache_key="default", payload=resp.model_dump(mode="json"), expected_revision=cache_revision
         )
     except Exception as ex:
         logger.warning("每日论文缓存写入失败: %s", ex)
@@ -337,7 +338,7 @@ async def _build_daily_response(
 async def read_daily_cached_or_204(*, db_path: str) -> Response:
     import datetime as _dt
 
-    date_key = _dt.datetime.now().strftime("%Y-%m-%d")
+    date_key = today_key()
     try:
         cached = await run_in_threadpool(get_cache, db_path, date_key=date_key, cache_key="default")
         if not cached:
@@ -361,7 +362,8 @@ async def compute_daily_papers(
     try:
         import datetime
 
-        date_key = datetime.datetime.now().strftime("%Y-%m-%d")
+        date_key = today_key()
+        cache_revision = await run_sync(get_revision, db_path)
         force_refresh = bool(getattr(body, "force_refresh", False))
         try:
             _dbv = int(body.days_back if body.days_back is not None else 0)
@@ -389,7 +391,7 @@ async def compute_daily_papers(
             from .daily_support import invalidate_user_profile_cache
             from .daily_recommend_feedback import clear_daily_shown_for_date
 
-            invalidate_user_profile_cache()
+            invalidate_user_profile_cache(db_path)
             cleared = await run_in_threadpool(clear_daily_shown_for_date, str(db_path), date_key)
             if cleared:
                 logger.info("每日论文：force_refresh 已清除当日 shown 记录 %s 条", cleared)
@@ -409,7 +411,7 @@ async def compute_daily_papers(
             ),
             run_in_threadpool(extract_library_characteristics, library_papers),
         )
-        llm_categories = llm_arxiv_categories(agent, mem_kw_list, daily_arxiv_cs_categories)
+        llm_categories = await run_sync(llm_arxiv_categories, agent, mem_kw_list, daily_arxiv_cs_categories)
 
         all_external, source_counts, _arxiv_query = await fetch_external_candidates(
             searcher=searcher,
@@ -470,7 +472,7 @@ async def compute_daily_papers(
                 general_pick_hints=[],
             )
 
-        personalized_final, general_selected = await run_in_threadpool(
+        personalized_final, general_selected = await run_sync(
             _select_personalized_and_general,
             candidates=candidates,
             external_unique=external_unique,
@@ -502,20 +504,23 @@ async def compute_daily_papers(
             use_llm_theme_keywords=getattr(body, "use_llm_theme_keywords", True),
             agent=agent,
             daily_paper_identity_sig_fn=_identity,
+            cache_revision=cache_revision,
             papergraph_to_api_fn=papergraph_to_api_fn,
             db_path=db_path,
         )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="每日推荐计算超时") from exc
     except Exception:
         logger.exception("daily_service.compute_daily_papers_failed")
         raise HTTPException(status_code=500, detail="daily papers failed")
 
 
-async def record_user_daily_feedback(*, body, db_path) -> Any:
+async def record_user_daily_feedback(*, body, db_path, background_tasks=None) -> Any:
     import datetime
     from .daily_recommend_feedback import FeedbackAction
     from ...models.schemas import DailyRecommendFeedbackResponse
 
-    date_key = datetime.datetime.now().strftime("%Y-%m-%d")
+    date_key = today_key()
     identity_key = body.identity_key
     identity_type = "title_hash"
     if identity_key.startswith("arxiv:"):
@@ -539,29 +544,31 @@ async def record_user_daily_feedback(*, body, db_path) -> Any:
         category=body.category,
     )
 
-    if str(body.action) == "skip":
+    from .daily_support import invalidate_user_profile_cache
+    invalidate_user_profile_cache(db_path)
+    if ok:
+        from .daily_cache_store import invalidate_cache
+        await run_in_threadpool(invalidate_cache, db_path)
+    feedback_revision = await run_sync(get_revision, db_path) if ok else None
+
+    async def summarize_feedback():
         try:
-            await run_in_threadpool(
-                record_skip_negative_pref,
-                db_path,
-                identity_key=body.identity_key,
-                title=str(body.title or ""),
-                abstract=None,
-                journal=body.journal,
-                source=body.source,
-                keywords=body.keywords,
-                category=body.category,
-                ttl_days=14,
-            )
-            await run_in_threadpool(
-                maybe_promote_longterm_from_recent_skips,
-                db_path,
-                window_days=30,
-                min_count=5,
-                min_confidence=0.6,
-                max_new_rules=2,
-            )
-        except Exception:
-            pass
+            with execution_scope(30, independent=True):
+                await run_sync(record_skip_negative_pref, db_path, identity_key=body.identity_key,
+                               title=str(body.title or ""), abstract=None, journal=body.journal,
+                               source=body.source, keywords=body.keywords, category=body.category, ttl_days=14, expected_revision=feedback_revision,
+                               timeout_sec=25)
+                from .daily_support import invalidate_user_profile_cache
+                invalidate_user_profile_cache(db_path)
+                await run_sync(maybe_promote_longterm_from_recent_skips, db_path,
+                               window_days=30, min_count=5, min_confidence=0.6, max_new_rules=2)
+        except Exception as exc:
+            logger.warning("negative_feedback_summary_failed error=%s", type(exc).__name__)
+
+    if ok and getattr(body.action, "value", body.action) == "skip" and is_llm_configured():
+        if background_tasks is not None:
+            background_tasks.add_task(summarize_feedback)
+        else:
+            await summarize_feedback()
 
     return DailyRecommendFeedbackResponse(success=ok, message="反馈已记录" if ok else "记录失败")

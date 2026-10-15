@@ -10,6 +10,8 @@ from hello_agents import SimpleAgent
 
 from ..utils import parse_llm_json
 from ..services.llm.agent_config import papergraph_agent_config
+from ..services.llm.agent_runtime import run_json_task, check_active
+from ..services.llm.structured_output import finite_score
 from .base import BaseAgent
 from .prompts.knowledge_graph import REL_PROMPT
 
@@ -30,12 +32,7 @@ class KnowledgeGraphAgent(BaseAgent):
         self.min_score = min_score
         self.max_edges = max_edges
         self.chunk_size = chunk_size
-        self._agent = agent or SimpleAgent(
-            name="papergraph_kg_rel",
-            llm=self.llm,
-            system_prompt=REL_PROMPT,
-            config=papergraph_agent_config(),
-        )
+        self._agent = agent
 
     def _candidate_id(self, paper: dict[str, Any]) -> int | None:
         for key in ("paper_id", "id", "target_paper_id"):
@@ -69,18 +66,24 @@ class KnowledgeGraphAgent(BaseAgent):
             if not isinstance(e, dict):
                 continue
             try:
-                tid = int(e.get("target_paper_id"))
-                score = float(e.get("score") or 0.0)
+                if type(e.get("target_paper_id")) is not int:
+                    continue
+                tid = e["target_paper_id"]
+                score = finite_score(e.get("score"))
             except Exception:
                 continue
             if tid not in allowed_ids or score < self.min_score:
                 continue
             relation = str(e.get("relation") or "").strip()
-            if not relation:
+            if relation not in {"improves", "extends", "uses", "compares", "surveys", "references", "dataset_overlap", "method_overlap", "task_overlap"}:
+                continue
+            if not str(e.get("evidence") or "").strip():
                 continue
             edge = {"target_paper_id": tid, "relation": relation,
                     "score": max(0.0, min(1.0, score)),
-                    "evidence": str(e.get("evidence") or "").strip()[:80]}
+                    "evidence": str(e.get("evidence") or "").strip()[:800],
+                    "evidence_location": str(e.get("evidence_location") or "").strip()[:120],
+                    "evidence_quote": str(e.get("evidence_quote") or "").strip()[:600]}
             if tid not in best or score > best[tid]["score"]:
                 best[tid] = edge
         return sorted(best.values(), key=lambda x: x["score"], reverse=True)
@@ -110,12 +113,18 @@ class KnowledgeGraphAgent(BaseAgent):
         for chunk in self._chunks(compact_candidates):
             payload = {"new_paper": compact_new, "candidates": chunk}
             try:
-                raw = self._agent.run(json.dumps(payload, ensure_ascii=False))
+                check_active()
+                if self._agent is not None:
+                    raw = self._agent.run(json.dumps(payload, ensure_ascii=False))
+                    data = parse_llm_json(raw)
+                else:
+                    data = run_json_task(task_name="kg_relations", agent_name="papergraph_kg_rel", llm=self.llm,
+                                         system_prompt=REL_PROMPT, user_prompt=json.dumps(payload, ensure_ascii=False), retries=0)
+
             except Exception as exc:
                 logger.exception("kg_llm_run_failed")
                 raise RuntimeError("kg_llm_run_failed") from exc
 
-            data = parse_llm_json(raw)
             if data is None:
                 raise ValueError("kg_llm_parse_failed")
 
@@ -127,27 +136,17 @@ class KnowledgeGraphAgent(BaseAgent):
             except Exception as exc:
                 raise ValueError("kg_edge_validation_failed") from exc
 
+            source_text = " ".join(str(compact_new.get(key) or "") for key in ("abstract", "pdf_excerpt", "related_work_excerpt")).casefold()
             for edge in valid_edges:
+                if edge["relation"] in {"improves", "extends", "uses", "compares", "references"}:
+                    quote = " ".join(edge.get("evidence_quote", "").casefold().split())
+                    if not quote or quote not in " ".join(source_text.split()):
+                        continue
                 tid = edge["target_paper_id"]
                 if tid not in merged or edge["score"] > merged[tid]["score"]:
                     merged[tid] = edge
 
         edges = sorted(merged.values(), key=lambda x: x["score"], reverse=True)[: self.max_edges]
 
-        try:
-            from ..services.memory.agent_memory import get_agent_memory
-
-            am = get_agent_memory()
-            title = str(new_paper.get("title") or "")[:120]
-            am.add(agent_name="knowledge_graph", content=f"关系抽取：{title}", memory_type="working", importance=0.45, shared=False)
-            if edges:
-                am.add(
-                    agent_name="knowledge_graph",
-                    content=f"关系抽取要点：top_relation={edges[0].get('relation')} score={edges[0].get('score')}",
-                    memory_type="working",
-                    importance=0.5,
-                    shared=True,
-                )
-        except Exception:
-            logger.debug("kg_memory_write_failed", exc_info=True)
+        check_active()
         return edges, None

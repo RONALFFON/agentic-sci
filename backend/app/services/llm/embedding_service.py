@@ -19,6 +19,8 @@ from typing import Any, Optional, Sequence
 import httpx
 
 from ...settings import get_settings
+from .agent_runtime import check_active, remaining_seconds
+from ..task_state import identity, task_lock
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ _CACHE_MAXSIZE = 256
 
 
 def _l2_normalize(vec: Sequence[float]) -> list[float]:
+    if any(not math.isfinite(float(x)) for x in vec):
+        raise ValueError("embedding_nonfinite")
     norm = math.sqrt(sum(float(x) * float(x) for x in vec))
     if norm <= 0.0:
         return [float(x) for x in vec]
@@ -63,11 +67,11 @@ class EmbeddingService:
             hit = self._cache.get(key)
             if hit is not None:
                 self._cache.move_to_end(key)
-            return hit
+            return list(hit) if hit is not None else None
 
     def _cache_put(self, key: tuple[str, int, str], vec: list[float]) -> None:
         with self._cache_lock:
-            self._cache[key] = vec
+            self._cache[key] = list(vec)
             self._cache.move_to_end(key)
             while len(self._cache) > _CACHE_MAXSIZE:
                 self._cache.popitem(last=False)
@@ -87,7 +91,7 @@ class EmbeddingService:
 
         out: list[list[float]] = []
         try:
-            with httpx.Client(trust_env=c["trust_env"], timeout=c["timeout"]) as client:
+            with httpx.Client(trust_env=c["trust_env"], timeout=remaining_seconds(c["timeout"])) as client:
                 for i in range(0, len(cleaned), batch_size):
                     batch = cleaned[i : i + batch_size]
                     payload: dict[str, Any] = {
@@ -97,12 +101,13 @@ class EmbeddingService:
                     }
                     if c["dimensions"] > 0:
                         payload["dimensions"] = c["dimensions"]
-                    resp = client.post(url, json=payload, headers=headers)
+                    check_active()
+                    resp = client.post(url, json=payload, headers=headers, timeout=remaining_seconds(c["timeout"]))
+                    check_active()
                     if resp.status_code != 200:
                         logger.debug(
-                            "embedding_http_failed status=%s body=%s",
+                            "embedding_http_failed status=%s",
                             resp.status_code,
-                            resp.text[:200],
                         )
                         return []
                     data = resp.json()
@@ -138,16 +143,19 @@ class EmbeddingService:
         if not q or not self.is_configured():
             return None
         c = self._cfg()
-        key = (c["model"], c["dimensions"], q)
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        vecs = self.embed_texts([q])
-        if not vecs:
-            return None
-        vec = vecs[0]
-        self._cache_put(key, vec)
-        return vec
+        key = (identity(c["base_url"], c["model"]), c["dimensions"], q)
+        with task_lock(identity("embedding", key)):
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
+            vecs = self.embed_texts([q])
+            if not vecs:
+                return None
+            vec = vecs[0]
+            check_active()
+            self._cache_put(key, vec)
+            return list(vec)
+
 
 
 _embedding_service: Optional[EmbeddingService] = None

@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 
 from ...utils.common import exec_sql
+from ..llm.agent_runtime import check_active
 
 def ensure_tables(db_path: str) -> None:
     exec_sql(db_path,
@@ -21,6 +22,7 @@ def _conn(db_path: str, *, row_factory=None):
         conn.row_factory = row_factory
     try:
         yield conn
+        check_active()
         conn.commit()
     finally:
         conn.close()

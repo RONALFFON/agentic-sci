@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.llm.agent_runtime import run_sync
+
 import asyncio
 from collections import Counter
 from dataclasses import dataclass
@@ -149,7 +151,7 @@ async def rank_candidates(
     prefer_rec = (plan.sort or "").strip().lower() == "date" or bool(plan.year_from) or bool(venue)
     try:
         with anyio.fail_after(runtime.rank_wall):
-            ranked, ranking_metadata = await anyio.to_thread.run_sync(
+            ranked, ranking_metadata = await run_sync(
                 lambda: ranker.rank(
                     candidates,
                     ctx.rank_query,
@@ -210,7 +212,7 @@ async def run_search_pipeline_async(
     if pinned_ids and searcher is not None:
         try:
             with anyio.fail_after(3.0):
-                candidates = await anyio.to_thread.run_sync(
+                candidates = await run_sync(
                     _merge_pinned_papers, candidates, pinned_ids, searcher
                 )
         except TimeoutError:

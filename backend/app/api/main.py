@@ -60,6 +60,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("%s", "=" * 60)
     logger.info("👋 应用正在关闭...")
+    from ..services.llm.agent_runtime import shutdown_agent_runtime
     if daily_refresh_task is not None:
         daily_refresh_task.cancel()
         try:
@@ -68,6 +69,9 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             logger.debug("每日论文后台任务结束异常", exc_info=True)
+    shutdown_agent_runtime()
+    from ..services.llm.llm_service import close_llm
+    await close_llm()
     logger.info("%s", "=" * 60)
 
 app = FastAPI(
@@ -88,6 +92,8 @@ app.add_middleware(
 )
 
 app.add_middleware(_MeaningfulActivityMiddleware)
+from .agent_execution import AgentExecutionMiddleware
+app.add_middleware(AgentExecutionMiddleware)
 
 app.include_router(paper_routes.router, prefix="/api")
 app.include_router(paper_reader_routes.router, prefix="/api")

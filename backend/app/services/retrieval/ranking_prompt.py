@@ -170,7 +170,7 @@ def build_ranking_prompt(
     main_track_hint = ""
     if main_conference_proceedings_only and target_venue:
         um = (intent_source_message or "").strip()
-        um_block = f"\n### 用户原始表述\n{um[:700]}\n" if um else ""
+        um_block = f"\n### 用户原始表述\n{um[-2400:]}\n" if um else ""
         main_track_hint = f"""
 ## 主会议录用
 仅保留 **{target_venue}** 主会正式论文；排除 workshop、卫星会等。{um_block}

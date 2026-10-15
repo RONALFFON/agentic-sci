@@ -6,6 +6,13 @@ import json
 import logging
 import re
 import time
+import asyncio
+import copy
+import weakref
+from collections import OrderedDict
+from pathlib import Path
+from ..task_state import identity, file_version, today_key
+from ..llm.agent_runtime import run_sync, check_active
 from collections import Counter
 from typing import Any
 
@@ -29,8 +36,9 @@ _ARXIV_QUERY_NOISE = frozenset({
 })
 _OPENALEX_FALLBACK_QUERY = "machine learning neural network transformer deep learning"
 
-_user_profile_cache: tuple[Any, ...] | None = None
-_user_profile_cache_ts: float = 0.0
+_profile_cache = OrderedDict()
+_profile_locks = weakref.WeakKeyDictionary()
+_profile_revisions: dict[str, int] = {}
 _USER_PROFILE_CACHE_TTL = 7200
 
 
@@ -65,7 +73,7 @@ def collect_memory_store_texts(
 ) -> list[str]:
     raw_texts: list[str] = []
     for line in store.list_recent_contents(
-        scope="global", paper_id=None, kinds=["preference", "working", "short"], limit=global_limit
+        scope="global", paper_id=None, kinds=["preference"], limit=global_limit
     ):
         s = str(line or "").strip()
         if s:
@@ -86,7 +94,7 @@ def collect_memory_store_texts(
         for line in store.list_recent_contents(
             scope="paper",
             paper_id=i,
-            kinds=["short", "working", "paper_summary"],
+            kinds=["paper_summary"],
             limit=snippets_per_paper,
         ):
             s = str(line or "").strip()
@@ -193,8 +201,8 @@ async def extract_memory_keywords_via_llm(raw_texts: list[str], log: Any) -> set
     if not raw_texts:
         return set()
     try:
-        agent = get_search_agent()
-        llm = getattr(agent, "llm", None)
+        from ..llm.llm_service import get_llm
+        llm = await run_sync(get_llm)
         if not llm:
             return set()
         seen: set[str] = set()
@@ -216,7 +224,7 @@ async def extract_memory_keywords_via_llm(raw_texts: list[str], log: Any) -> set
             f"{memory_block}\n\n"
             'Format: ["keyword1", ...]'
         )
-        raw = await run_in_threadpool(
+        raw = await run_sync(
             llm.invoke,
             [{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -234,7 +242,7 @@ async def extract_memory_keywords_via_llm(raw_texts: list[str], log: Any) -> set
             except Exception:
                 return set()
         if isinstance(parsed, list):
-            return {str(x).strip().lower() for x in parsed if str(x).strip() and len(str(x).strip()) >= 2}
+            return {x.strip().lower() for x in parsed if isinstance(x, str) and 2 <= len(x.strip()) <= 80}
         return set()
     except Exception as e:
         log.warning("LLM 提取记忆关键词失败: %s", e)
@@ -266,8 +274,8 @@ async def load_memory_keywords(*, db_path: str, lib_ids: list[int], log: Any) ->
     async def _load_shared_kw() -> set[str] | None:
         from ..memory.agent_memory import get_agent_memory
 
-        am = get_agent_memory()
-        shared_lines = am.recent(agent_name="shared", memory_types=["working", "episodic"], limit=40, shared=True)
+        am = get_agent_memory(db_path)
+        shared_lines = am.recent(agent_name="shared", memory_types=["preference"], limit=40, shared=True)
         if not shared_lines:
             return None
         shared_texts = [str(ln).strip() for ln in shared_lines if str(ln).strip()]
@@ -315,37 +323,35 @@ async def load_user_context(
     return mem_kw, mem_kw_n, mem_kw_list, skipped_papers
 
 
-def invalidate_user_profile_cache() -> None:
-    global _user_profile_cache, _user_profile_cache_ts
-    _user_profile_cache = None
-    _user_profile_cache_ts = 0.0
+def invalidate_user_profile_cache(db_path: str | None = None) -> None:
+    roots = [str(Path(db_path).resolve())] if db_path else list(_profile_revisions)
+    for root in roots:
+        _profile_revisions[root] = _profile_revisions.get(root, 0) + 1
+    for key in list(_profile_cache):
+        if db_path is None or key[0] == str(Path(db_path).resolve()):
+            _profile_cache.pop(key, None)
 
 
-async def get_or_load_user_context(
-    *,
-    db_path: str,
-    lib_ids: list[int],
-    log: Any,
-    force_reload: bool = False,
-    include_shown_exclusions: bool = True,
-) -> tuple[set[str], int, list[str], set[str]]:
-    global _user_profile_cache, _user_profile_cache_ts
-    now = time.time()
-    if (
-        not force_reload
-        and _user_profile_cache is not None
-        and (now - _user_profile_cache_ts) < _USER_PROFILE_CACHE_TTL
-    ):
-        return _user_profile_cache
-    result = await load_user_context(
-        db_path=db_path,
-        lib_ids=lib_ids,
-        log=log,
-        include_shown_exclusions=include_shown_exclusions,
-    )
-    _user_profile_cache = result
-    _user_profile_cache_ts = now
-    return result
+async def get_or_load_user_context(*, db_path: str, lib_ids: list[int], log: Any,
+                                   force_reload: bool = False, include_shown_exclusions: bool = True):
+    loop = asyncio.get_running_loop()
+    lock = _profile_locks.setdefault(loop, asyncio.Lock())
+    root = str(Path(db_path).resolve())
+    revision = _profile_revisions.setdefault(root, 0)
+    key = (root, identity(revision, sorted(lib_ids), include_shown_exclusions, today_key(), get_settings().openai_model, get_settings().openai_base_url, "profile-v2", file_version(root), file_version(root + "-wal")))
+    async with lock:
+        cached = _profile_cache.get(key)
+        if not force_reload and cached and time.monotonic() - cached[0] < _USER_PROFILE_CACHE_TTL:
+            _profile_cache.move_to_end(key)
+            return copy.deepcopy(cached[1])
+        result = await load_user_context(db_path=db_path, lib_ids=lib_ids, log=log,
+                                         include_shown_exclusions=include_shown_exclusions)
+        check_active()
+        if _profile_revisions.get(root, 0) == revision:
+            _profile_cache[key] = (time.monotonic(), copy.deepcopy(result))
+        while len(_profile_cache) > 64:
+            _profile_cache.popitem(last=False)
+        return result
 
 
 def daily_arxiv_category_list(daily_arxiv_cs_categories: list[str] | None) -> list[str]:

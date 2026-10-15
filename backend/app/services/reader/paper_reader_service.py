@@ -7,6 +7,8 @@ from typing import Any
 from collections.abc import Iterable
 
 from fastapi import BackgroundTasks, HTTPException
+from ..llm.agent_runtime import run_sync, execution_scope, check_active
+from ..task_state import identity, file_version, task_lock
 from starlette.concurrency import run_in_threadpool
 
 from ...agents import get_paper_analysis_agent
@@ -55,7 +57,7 @@ class PaperReaderService:
             lines.append(f"{label}：{content}")
         return "\n\n".join(lines)
 
-    async def _build_reader_context(self, paper_id: int, user_message: str = "") -> tuple[Any, str, str]:
+    async def _build_reader_context(self, paper_id: int, user_message: str = "") -> tuple[Any, str, str, str, bool]:
         from ..memory.memory_store import MemoryStore
         from .paper_reader_context import build_reader_context_for_paper
 
@@ -63,10 +65,8 @@ class PaperReaderService:
         if not paper:
             raise HTTPException(status_code=404, detail="文献不存在")
 
-        mem = await run_in_threadpool(
-            MemoryStore(self._db.db_path).build_context_block,
-            paper_id=paper_id,
-        )
+        mem = await run_sync(MemoryStore(self._db.db_path).get_context_for_query,
+                             paper_id=paper_id, query=user_message, limit=6) if user_message else ""
         title_hint = str(getattr(paper, "title", None) or "")
         ctx = (base_ctx + ("\n\n" + mem if mem else "")).strip()
         return paper, ctx, title_hint, pdf_ref_text, pdf_parsing
@@ -113,11 +113,13 @@ class PaperReaderService:
 
     @suppress_exceptions_async(default_return=None, log_level="warning", log_message="paper_reader.memory_update_failed")
     async def _update_memory(self, *, store: Any, paper_id: int, user_message: str, reply: str) -> None:
-        await run_in_threadpool(
-            _update_memory_from_turn,
-            store=store, paper_id=paper_id,
-            user_message=user_message, assistant_reply=reply,
-        )
+        with execution_scope(30, independent=True):
+            await run_sync(
+                _update_memory_from_turn,
+                store=store, paper_id=paper_id,
+                user_message=user_message, assistant_reply=reply,
+            )
+            await run_sync(store.compress_working, scope="paper", paper_id=int(paper_id), min_entries=6)
 
     async def get_opening(self, *, paper_id: int, background_tasks: BackgroundTasks) -> dict:
         from .reader_opening_cache import get_cached_opening, set_cached_opening
@@ -127,6 +129,7 @@ class PaperReaderService:
         paper, ctx, title_hint, pdf_ref_text, pdf_parsing = await self._build_reader_context(paper_id)
 
         reader_snap = build_reader_snap(paper, pdf_text_for_references=pdf_ref_text)
+        reader_snap["_db_path"] = self._db.db_path
         try:
             pdf_path = self._db.get_library_pdf_abspath(paper_id)
             if pdf_path:
@@ -136,32 +139,34 @@ class PaperReaderService:
         if pdf_parsing:
             self._schedule_pdf_excerpt(paper_id, ctx, background_tasks)
 
-        cached, fresh = await run_in_threadpool(get_cached_opening, self._db.db_path, paper_id, 72)
-        if cached and fresh:
-            op = cached.strip()
-            await self._ensure_opening_turn_safe(paper_id=paper_id, opening_text=op)
-            return {"opening": op, "pdf_parsing": pdf_parsing}
+        original_file = file_version(reader_snap.get("_pdf_abspath"))
+        version = identity("reader-opening-v2", ctx, original_file, _OPENING_PROMPT,
+                           getattr(getattr(self._agent, "llm", None), "model", None),
+                           getattr(getattr(self._agent, "llm", None), "base_url", None))
+        def generate():
+            with task_lock("opening:" + identity(self._db.db_path, paper_id)):
+                cached2, fresh2 = get_cached_opening(self._db.db_path, paper_id, 72, version)
+                if cached2 and fresh2:
+                    return cached2
+                opening, _, _ = self._agent.paper_reader_reply(ctx, _NO_HISTORY_PLACEHOLDER, _OPENING_PROMPT, reader_snap)
+                check_active()
+                if file_version(reader_snap.get("_pdf_abspath")) == original_file:
+                    set_cached_opening(self._db.db_path, paper_id, opening.strip(), version)
+                return opening.strip()
 
-        if cached and not fresh:
-            def _refresh() -> None:
-                try:
-                    opening2, _, _ = self._agent.paper_reader_reply(
-                        ctx, _NO_HISTORY_PLACEHOLDER, _OPENING_PROMPT, reader_snap
-                    )
-                    set_cached_opening(self._db.db_path, paper_id, opening2.strip())
-                except Exception as exc:
-                    logger.warning("paper_reader.opening_refresh_failed", extra={"paper_id": paper_id}, exc_info=exc)
-
-            background_tasks.add_task(_refresh)
-            op = cached.strip()
-            await self._ensure_opening_turn_safe(paper_id=paper_id, opening_text=op)
-            return {"opening": op, "pdf_parsing": pdf_parsing}
-
-        opening, _, _ = await run_in_threadpool(
-            lambda: self._agent.paper_reader_reply(ctx, _NO_HISTORY_PLACEHOLDER, _OPENING_PROMPT, reader_snap)
-        )
-        op = opening.strip()
-        await run_in_threadpool(set_cached_opening, self._db.db_path, paper_id, op)
+        cached, fresh = await run_in_threadpool(get_cached_opening, self._db.db_path, paper_id, 72, version)
+        if cached:
+            if not fresh:
+                async def refresh():
+                    try:
+                        with execution_scope(120, independent=True):
+                            await run_sync(generate, timeout_sec=120)
+                    except Exception:
+                        logger.warning("paper_reader.opening_refresh_failed paper_id=%s", paper_id)
+                background_tasks.add_task(refresh)
+            await self._ensure_opening_turn_safe(paper_id=paper_id, opening_text=cached)
+            return {"opening": cached, "pdf_parsing": pdf_parsing}
+        op = await run_sync(generate, timeout_sec=120)
         await self._ensure_opening_turn_safe(paper_id=paper_id, opening_text=op)
         return {"opening": op, "pdf_parsing": pdf_parsing}
 
@@ -179,6 +184,7 @@ class PaperReaderService:
         from .paper_reader_context import build_reader_snap
 
         reader_snap = build_reader_snap(paper, pdf_text_for_references=pdf_ref_text)
+        reader_snap["_db_path"] = self._db.db_path
         try:
             pdf_path = self._db.get_library_pdf_abspath(paper_id)
             if pdf_path:
@@ -188,19 +194,12 @@ class PaperReaderService:
         self._schedule_pdf_excerpt(paper_id, ctx, background_tasks)
 
         store = MemoryStore(self._db.db_path)
-        rel_mem = await run_in_threadpool(
-            store.get_context_for_query,
-            paper_id=int(paper_id),
-            query=user_message,
-            limit=6,
-        )
-        if rel_mem:
-            ctx += "\n\n" + rel_mem
         hist = self._format_reader_history(messages)
 
-        reply, related_papers, related_sources = await run_in_threadpool(
-            lambda: self._agent.paper_reader_reply(ctx, hist, user_message, reader_snap)
+        reply, related_papers, related_sources = await run_sync(
+            self._agent.paper_reader_reply, ctx, hist, user_message, reader_snap, timeout_sec=120
         )
+        check_active()
         rs = list(related_sources or [])
         related_hints: list[dict[str, Any]] = [
             {
@@ -218,8 +217,8 @@ class PaperReaderService:
         ]
 
         await self._append_history(paper_id=paper_id, user_message=user_message, reply=reply)
-        await self._update_memory(store=store, paper_id=paper_id, user_message=user_message, reply=reply)
-        background_tasks.add_task(store.compress_working, scope="paper", paper_id=int(paper_id), min_entries=6)
+        background_tasks.add_task(self._update_memory, store=store, paper_id=paper_id, user_message=user_message, reply=reply)
+        # 清理与写入在同一个后台预算内完成。
 
         return {
             "reply": reply.strip(),

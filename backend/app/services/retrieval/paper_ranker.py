@@ -13,6 +13,7 @@ from app.core.paper import Paper as LitPaper
 
 from ..llm.agent_runtime import _exception_chain_predicate, run_agent_task
 from ..llm.llm_service import get_llm
+from ..llm.structured_output import finite_score
 from ..search_intent import extract_json_object
 from ...settings import get_settings
 from .paper_filters import should_exclude_main_conference_paper
@@ -148,7 +149,10 @@ class LlmPaperRanker:
             if not isinstance(r, dict):
                 continue
             try:
-                idx = int(r.get("paper_index", r.get("index", 0))) - 1
+                raw_index = r.get("paper_index", r.get("index"))
+                if type(raw_index) is not int:
+                    continue
+                idx = raw_index - 1
             except (TypeError, ValueError):
                 continue
             if idx in seen_idx or not (0 <= idx < len(papers)):
@@ -156,9 +160,9 @@ class LlmPaperRanker:
             seen_idx.add(idx)
             rp = papers[idx]
             try:
-                rp.fine_score = float(r.get("fine_score", 0))
+                rp.fine_score = finite_score(r.get("fine_score"), 0, 100)
             except (TypeError, ValueError):
-                rp.fine_score = 0.0
+                continue
             rp.ranking_reason = str(r.get("reason", "") or "").strip()
             result_list.append(rp)
         return result_list
@@ -305,16 +309,8 @@ class LlmPaperRanker:
                 try:
                     retry_limit = min(max(int(top_k or 10) * 2, 12), max(12, cand_limit))
                     retry_candidates = list(papers or [])[:retry_limit]
-                    prompt2 = build_ranking_prompt(
-                        retry_candidates,
-                        query,
-                        top_k,
-                        ranking_profile=profile,
-                        abstract_max_chars=min(280, max(160, abs_max // 2)),
-                        target_venue=target_venue,
-                        main_conference_proceedings_only=main_conference_proceedings_only,
-                        intent_source_message=intent_source_message,
-                    )
+                    retry_kwargs = {**rank_kwargs, "abstract_max_chars": min(280, max(160, abs_max // 2))}
+                    prompt2 = build_ranking_prompt(retry_candidates, query, top_k, **retry_kwargs)
                     ranked2, method2 = self._rank_from_llm_output(
                         self._invoke_llm_rank(
                             retry_candidates,
@@ -359,7 +355,7 @@ class LlmPaperRanker:
 
             fallback = sorted(list(papers or []), key=_pool_fallback_sort_key, reverse=True)
             if main_conference_proceedings_only and target_venue:
-                yf, yt = kwargs.get("year_from"), kwargs.get("year_to")
+                yf, yt = year_from, year_to
                 pin_y = int(yf) if yf is not None and yf == yt else None
                 fallback = [
                     rp
@@ -428,7 +424,8 @@ class LlmPaperRanker:
                 method_acronym=(kwargs.get("method_acronym") or "").strip() or None,
             )
             method = fine_method
-        except Exception:
+        except Exception as exc:
+            logger.warning("rank_fallback error=%s", type(exc).__name__)
             fine_result = sorted(candidate_pool, key=_pool_fallback_sort_key, reverse=True)[:final_k]
             method = "recall_fallback"
 

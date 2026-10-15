@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from ...services.llm.agent_runtime import run_sync, request_id as execution_request_id
 from ...agents.search_agent import SearchAgent, SearchIntent, get_search_agent
 from ...api.dependencies import get_searcher
 from ...api.search_route_support import (
@@ -125,14 +126,24 @@ def _error_response(msg: str) -> SearchAgentResponse:
 async def _prepare_agent_and_query(request: SearchAgentMessage) -> tuple[SearchAgent, str]:
     try:
         with anyio.fail_after(_SEARCH_AGENT_INIT_SEC):
-            agent = await anyio.to_thread.run_sync(get_search_agent)
+            agent = await run_sync(get_search_agent, timeout_sec=_SEARCH_AGENT_INIT_SEC)
     except TimeoutError as exc:
         logger.warning("search-agent init timeout after %.0fs", _SEARCH_AGENT_INIT_SEC, exc_info=exc)
         raise HTTPException(status_code=504, detail="search_agent_init_timeout") from exc
-    return agent, (request.message or "").strip()
+    from ...services.search_intent.conversation import format_search_message
+    message = format_search_message(request.message, request.history)
+    return agent, message
 
 
-async def _run_search_agent_core(
+async def _run_search_agent_core(*, agent: SearchAgent, request: SearchAgentMessage, merged_query: str,
+                                 searcher: Any, stage_callback=None) -> SearchAgentResponse:
+    from ...services.task_state import identity, async_task_lock
+    async with async_task_lock(identity("search", merged_query, request.model_dump(mode="json"))):
+        return await _run_search_agent_core_unlocked(agent=agent, request=request, merged_query=merged_query,
+                                                     searcher=searcher, stage_callback=stage_callback)
+
+
+async def _run_search_agent_core_unlocked(
     *,
     agent: SearchAgent,
     request: SearchAgentMessage,
@@ -147,8 +158,8 @@ async def _run_search_agent_core(
             stage_callback(stage, status, message, details)
 
     emit_stage("intent_parsing", "running", "正在解析检索意图")
-    intent = agent.understand_intent(merged_query, request.mode)
-    with track_tool_call(tool_calls, "understand_intent", {"query": merged_query}) as tc:
+    with track_tool_call(tool_calls, "understand_intent", {"query": request.message}) as tc:
+        intent = await run_sync(agent.understand_intent, merged_query, request.mode, timeout_sec=60)
         tc.result_summary = f"sort={intent.sort}, venues={intent.venues}, yf={intent.year_from}, kw={intent.keywords}"
     emit_stage(
         "intent_parsing",
@@ -325,7 +336,7 @@ async def search_agent_chat_stream(
     request: SearchAgentMessage,
     searcher=Depends(get_searcher),
 ):
-    request_id = uuid4().hex[:16]
+    request_id = execution_request_id() or uuid4().hex[:16]
 
     async def gen():
         # SSE 流式生成器：通过 anyio 内存通道实现事件驱动的流式推送

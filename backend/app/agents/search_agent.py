@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+import copy
+import threading
+from collections import OrderedDict
 import time
 from typing import Any, Optional
 
 from ..core.search.paper_searcher import _sanitize_author_list_for_query
 from ..models.schemas import Paper
 from ..services.llm.llm_service import coerce_hello_agents_llm_output_to_str
-from ..services.llm.agent_config import papergraph_agent_config
+from ..services.llm.agent_runtime import run_agent_task, check_active
+from ..services.task_state import identity, task_lock, today_key
 from ..services.search_intent import (
     apply_llm_intent_hygiene,
     extract_json_object,
@@ -25,7 +29,8 @@ from .support.search_models import SearchIntent
 
 logger = logging.getLogger(__name__)
 
-_INTENT_CACHE: dict[tuple[str, str], tuple[float, SearchIntent]] = {}
+_INTENT_CACHE: OrderedDict[str, tuple[float, SearchIntent]] = OrderedDict()
+_INTENT_CACHE_LOCK = threading.RLock()
 _INTENT_CACHE_TTL = 300.0
 
 
@@ -34,7 +39,6 @@ class SearchAgent(BaseAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        self._intent_parser_agent: Optional[Any] = None
         self.intent_parser = IntentParser(self)
         self.explainer = _SearchExplainer()
 
@@ -58,19 +62,9 @@ class SearchAgent(BaseAgent):
         prompt = format_intent_llm_prompt(
             tmpl, msg, profile, correction_hint=(correction_hint or "").strip() or None
         )
-        from hello_agents import SimpleAgent
-
-        parser_agent = self._intent_parser_agent
-        if parser_agent is None:
-            parser_agent = SimpleAgent(
-                name="intent_parser",
-                llm=self.llm,
-                system_prompt="你是学术检索意图解析器。只输出 JSON，不要解释。",
-                config=papergraph_agent_config(),
-            )
-            self._intent_parser_agent = parser_agent
-
-        resp = parser_agent.run(prompt)
+        resp = run_agent_task(task_name="intent_parser", agent_name="intent_parser", llm=self.llm,
+                              system_prompt="你是学术检索意图解析器。只输出 JSON，不要解释。",
+                              user_prompt=prompt, retries=0)
         text = coerce_hello_agents_llm_output_to_str(resp).strip()
         payload = extract_json_object(text)
         if not payload:
@@ -104,21 +98,25 @@ class IntentParser:
         if not msg:
             return SearchIntent()
 
-        # 5 分钟内相同查询命中缓存，避免重复调用 LLM
-        cache_key = (msg.lower()[:200], (profile or "accuracy").strip().lower())
-        now = time.time()
-        if cache_key in _INTENT_CACHE:
-            ts, cached = _INTENT_CACHE[cache_key]
-            if now - ts < _INTENT_CACHE_TTL:
-                return cached
-
-        intent = self._parse_with_retry(msg, profile)
-        _INTENT_CACHE[cache_key] = (now, intent)
-        # LRU 淘汰：缓存超过 200 条时删除最旧条目
-        if len(_INTENT_CACHE) > 200:
-            oldest = min(_INTENT_CACHE, key=lambda k: _INTENT_CACHE[k][0])
-            del _INTENT_CACHE[oldest]
-        return intent
+        settings = get_settings()
+        cache_key = identity(msg, self._agent._normalize_profile(profile), str(settings.data_dir),
+                             getattr(self._agent.llm, "model", None), getattr(self._agent.llm, "base_url", None),
+                             self._agent.INTENT_LLM_PROMPT, today_key())
+        with task_lock("intent:" + cache_key):
+            now = time.monotonic()
+            with _INTENT_CACHE_LOCK:
+                cached = _INTENT_CACHE.get(cache_key)
+                if cached and now - cached[0] < _INTENT_CACHE_TTL:
+                    _INTENT_CACHE.move_to_end(cache_key)
+                    return copy.deepcopy(cached[1])
+            intent = self._parse_with_retry(msg, profile)
+            check_active()
+            with _INTENT_CACHE_LOCK:
+                _INTENT_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(intent))
+                _INTENT_CACHE.move_to_end(cache_key)
+                while len(_INTENT_CACHE) > 200:
+                    _INTENT_CACHE.popitem(last=False)
+            return intent
 
     def _parse_with_retry(self, msg: str, profile: str) -> SearchIntent:
         from ..services.search_intent.parsing import build_intent_retry_correction_hint
@@ -127,7 +125,7 @@ class IntentParser:
         if not self._agent.llm:
             raise RuntimeError("search_agent_llm_unavailable")
         s = get_settings()
-        outer_retries = max(0, min(5, int(getattr(s, "papergraph_intent_parse_max_retries", 2) or 2)))
+        outer_retries = max(0, min(5, int(getattr(s, "papergraph_intent_parse_max_retries", 2))))
         correction: str | None = None
         last_exc: Exception | None = None
         last_output: str | None = None
@@ -145,7 +143,7 @@ class IntentParser:
                 )
                 if attempt >= outer_retries:
                     break
-                if "connection error" in str(e or "").lower() or "timed out" in str(e or "").lower():
+                if not isinstance(e, (ValueError, TypeError)):
                     break
                 correction = build_intent_retry_correction_hint(
                     e, user_message=msg, last_output=last_output
@@ -181,7 +179,7 @@ class IntentParser:
             raise ValueError("intent_parse_empty_query")
         apply_llm_intent_hygiene(out, msg)
         _ensure_intent_year_window_ordered(out)
-        out.raw_user_message = msg.strip()[:3200]
+        out.raw_user_message = msg.strip()
         out.authors = _sanitize_author_list_for_query(out.query or "", out.authors or [])
         return out
 
