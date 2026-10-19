@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any
 
 from fastapi import HTTPException
 
 from ...api.repo import RelationRepository
-from ...models.schemas import GraphEdge, GraphNode, LibraryGraphResponse
+from ...models.schemas import GraphEvidence, GraphEdge, GraphNode, LibraryGraphResponse
 from ...services.papers.papers_helpers import graph_author_label, graph_author_node_id
 from .kg_relations import ensure_tables
 
@@ -38,10 +39,9 @@ def build_library_graph(
                 return LibraryGraphResponse(success=True, nodes=[], edges=[])
             paper_ids_in_view: set[int] = {int(focus_id)}
         else:
-            papers = db.get_all_papers(limit=int(limit), order_by="created_at DESC")
             cat = (category or "").strip() or None
-            if cat:
-                papers = [p for p in papers if (getattr(p, "category", None) or "").strip() == cat]
+            papers = (db.search_library(category=cat, limit=int(limit)) if cat
+                      else db.get_all_papers(limit=int(limit), order_by="created_at DESC, id DESC"))
             paper_ids_in_view = set()
             for p in papers:
                 pid = int(getattr(p, "id") or 0)
@@ -120,14 +120,14 @@ def build_library_graph(
                             up_edge(GraphEdge(source=s, target=t, type="co_keyword", weight=0.5))
 
         try:
-            rel_rows: list[tuple[int, int, str, float, str]] = []
+            rel_rows: list[tuple[int, int, str, float, str, str]] = []
             if focus_id is not None:
                 rel_rows = repo.fetch_relation_rows(
                     focus_id=int(focus_id), paper_ids=None, limit=int(relation_edge_limit),
                     relation_types=_db_relation_types(relation_types), min_score=float(min_score),
                 )
                 rel_paper_ids: set[int] = {int(focus_id)}
-                for sid, tid, _, _, _ in rel_rows:
+                for sid, tid, *_ in rel_rows:
                     rel_paper_ids.add(int(sid))
                     rel_paper_ids.add(int(tid))
                 meta = repo.papers_minimal_by_ids(rel_paper_ids)
@@ -146,7 +146,7 @@ def build_library_graph(
                     relation_types=_db_relation_types(relation_types), min_score=float(min_score),
                 )
 
-            for sid, tid, rel, score, evidence in rel_rows:
+            for sid, tid, rel, score, evidence, provenance in rel_rows:
                 s = f"paper:{int(sid)}"
                 t = f"paper:{int(tid)}"
                 if s not in nodes or t not in nodes:
@@ -156,16 +156,29 @@ def build_library_graph(
                 rev = f"rev_{raw_rel}" if raw_rel else "related_to"
                 paper_rev_rel = f"paper_{rev}"
                 score_value = float(score or 0.6)
-                evidence_value = str(evidence or "").strip()[:240] or None
+                evidence_value = str(evidence or "").strip() or None
+                details = None
+                try:
+                    from ..task_state import identity
+                    data = json.loads(provenance) if provenance else {}
+                    if isinstance(data, dict) and data:
+                        details = GraphEvidence(
+                            source_paper_id=int(data.get('source_paper_id') or sid),
+                            location=str(data.get('location') or 'unspecified'),
+                            quote=str(data.get('quote') or ''), kind=str(data.get('kind') or 'unknown'),
+                            source_version=identity(data['source_version'])[:16] if data.get('source_version') else None,
+                        )
+                except (ValueError, TypeError):
+                    logger.debug('图谱证据格式无效', exc_info=True)
                 if _paper_relation_direction_allowed(relation_types, raw_rel, reverse=False):
                     up_edge(GraphEdge(
                         source=s, target=t, type=paper_rel,
-                        weight=score_value, evidence=evidence_value,
+                        weight=score_value, evidence=evidence_value, evidence_details=details,
                     ))
                 if _paper_relation_direction_allowed(relation_types, raw_rel, reverse=True):
                     up_edge(GraphEdge(
                         source=t, target=s, type=paper_rev_rel,
-                        weight=score_value * 0.8, evidence=evidence_value,
+                        weight=score_value * 0.8, evidence=evidence_value, evidence_details=details,
                     ))
         except Exception:
             logger.warning("graph_service: paper-paper relation fetch failed", exc_info=True)

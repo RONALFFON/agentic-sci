@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import statistics
@@ -19,6 +20,8 @@ def mean(values):
 
 
 def evaluate(cases, predictions, k=10):
+    if len({row['id'] for row in predictions}) != len(predictions):
+        raise ValueError('预测中存在重复案例 ID')
     rows = {row["id"]: row for row in predictions}
     intents, constraints, recalls, ndcgs, evidence, latencies, calls, tokens = ([] for _ in range(8))
     usage_missing = 0
@@ -53,10 +56,12 @@ def evaluate(cases, predictions, k=10):
         if "calls" in metrics:
             calls.append(metrics["calls"])
             usage_missing += metrics.get("usage_missing", 0)
-            if not metrics.get("usage_missing", 0):
+            if not metrics.get("usage_missing", 0) and 'total_tokens' in metrics:
                 tokens.append(metrics.get("total_tokens", 0))
     return {
         "case_count": len(cases), "observed_count": len(set(rows) & {case["id"] for case in cases}),
+        "coverage": len(set(rows) & {case['id'] for case in cases}) / len(cases) if cases else 0,
+        "missing_ids": [case['id'] for case in cases if case['id'] not in rows],
         "intent_accuracy": mean(intents), "constraint_satisfaction": mean(constraints),
         f"recall@{k}": mean(recalls), f"ndcg@{k}": mean(ndcgs), "evidence_support_rate": mean(evidence),
         "p95_latency_ms": sorted(latencies)[max(0, math.ceil(len(latencies) * 0.95) - 1)] if latencies else None,
@@ -64,6 +69,40 @@ def evaluate(cases, predictions, k=10):
         "calls_without_usage": usage_missing,
         "sample_counts": {"intent": len(intents), "constraints": len(constraints), "retrieval": len(recalls), "evidence": len(evidence)},
     }
+
+
+def compare_reports(cases, predictions, baseline, k):
+    """只比较两个版本共同完成的案例，避免覆盖率差异伪装成质量提升。"""
+    common = {row['id'] for row in predictions} & {row['id'] for row in baseline['predictions']}
+    paired_cases = [case for case in cases if case['id'] in common]
+    old_rows = {row['id']: row for row in baseline['predictions']}
+    new_rows = {row['id']: row for row in predictions}
+    old_paired, new_paired = [], []
+    for case in paired_cases:
+        old, new = old_rows[case['id']], new_rows[case['id']]
+        shared = set(old) & set(new)
+        left, right = ({key: row[key] for key in shared} for row in (old, new))
+        if 'metrics' in shared:
+            keys = set(old['metrics']) & set(new['metrics'])
+            left['metrics'] = {key: old['metrics'][key] for key in keys}
+            right['metrics'] = {key: new['metrics'][key] for key in keys}
+            if old['metrics'].get('usage_missing') or new['metrics'].get('usage_missing'):
+                left['metrics'].pop('total_tokens', None)
+                right['metrics'].pop('total_tokens', None)
+        old_paired.append(left)
+        new_paired.append(right)
+    before = evaluate(paired_cases, old_paired, k)
+    after = evaluate(paired_cases, new_paired, k)
+    higher_better = {'intent_accuracy', 'constraint_satisfaction', f'recall@{k}', f'ndcg@{k}', 'evidence_support_rate'}
+    lower_better = {'p95_latency_ms', 'mean_model_calls', 'mean_total_tokens_when_available'}
+    changes = {}
+    for key in sorted(higher_better | lower_better):
+        if before.get(key) is None or after.get(key) is None:
+            continue
+        delta = after[key] - before[key]
+        changes[key] = {'baseline': before[key], 'candidate': after[key], 'delta': delta,
+                        'regressed': delta < 0 if key in higher_better else delta > 0}
+    return {'paired_case_count': len(paired_cases), 'changes': changes}
 
 
 def live_intents(cases, max_calls):
@@ -116,17 +155,37 @@ def main():
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--max-calls", type=int, default=10)
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument('--baseline', type=Path, help='同一案例集的历史报告')
+    parser.add_argument('--min-coverage', type=float, default=0, help='最低案例覆盖率，0..1')
+    parser.add_argument('--fail-on-regression', action='store_true')
     args = parser.parse_args()
     if args.live and args.predictions:
         parser.error("--live 与 --predictions 不能同时使用")
     if not 1 <= args.max_calls <= 100 or not 1 <= args.k <= 100:
         parser.error("调用预算和 K 必须在 1..100 内")
+    if not 0 <= args.min_coverage <= 1 or (args.fail_on_regression and not args.baseline):
+        parser.error('覆盖率必须在 0..1 内，回归门禁必须指定基线')
     cases = json.loads(args.cases.read_text(encoding="utf-8"))
+    if len({case['id'] for case in cases}) != len(cases):
+        parser.error('案例 ID 重复')
+    fingerprint = hashlib.sha256(json.dumps(cases, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
     predictions = live_intents(cases, args.max_calls) if args.live else json.loads(args.predictions.read_text(encoding="utf-8")) if args.predictions else []
     report = {"mode": "live-intent" if args.live else "offline", "metrics": evaluate(cases, predictions, args.k), "predictions": predictions}
+    report.update(cases_sha256=fingerprint, k=args.k)
+    if args.baseline:
+        baseline = json.loads(args.baseline.read_text(encoding='utf-8'))
+        if baseline.get('cases_sha256') != fingerprint or baseline.get('k') != args.k:
+            parser.error('基线必须来自同一案例集及相同 K 值，请重新生成基线报告')
+        report['comparison'] = compare_reports(cases, predictions, baseline, args.k)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     print(f"已写入评测报告：{args.output}")
+    if report['metrics']['coverage'] < args.min_coverage:
+        raise SystemExit('案例覆盖率低于要求；报告已保留')
+    if args.fail_on_regression:
+        comparison = report['comparison']
+        if not comparison['changes'] or any(item['regressed'] for item in comparison['changes'].values()):
+            raise SystemExit('存在指标回退或没有可比较指标；报告已保留')
 
 
 if __name__ == "__main__":

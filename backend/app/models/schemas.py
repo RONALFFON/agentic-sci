@@ -104,6 +104,17 @@ class SavePapersResponse(BaseAPIResponse):
     ids: list[int] = Field(default_factory=list)
     pdf_downloaded: int = 0
     llm_classified: int = 0
+    processing_queued: int = 0
+
+class PaperProcessingStatus(BaseModel):
+    paper_id: int
+    status: str
+    phase: str
+    attempts: int
+    error: str | None = None
+
+class PaperProcessingResponse(BaseAPIResponse):
+    jobs: list[PaperProcessingStatus] = Field(default_factory=list)
 
 class DailyPaperPickHint(BaseModel):
     identity_key: str = Field(description="身份键，如 arxiv:2401.0001")
@@ -161,6 +172,13 @@ class GraphNode(BaseModel):
     venue_type: str | None = None
     weight: float = 1.0
 
+class GraphEvidence(BaseModel):
+    source_paper_id: int | None = None
+    location: str = 'unspecified'
+    quote: str = ''
+    kind: str = 'unknown'
+    source_version: str | None = None
+
 class GraphEdge(BaseModel):
     source: str
     target: str
@@ -168,6 +186,7 @@ class GraphEdge(BaseModel):
     weight: float = 1.0
 
     evidence: str | None = None
+    evidence_details: GraphEvidence | None = None
 
 class LibraryGraphResponse(BaseAPIResponse):
     nodes: list[GraphNode] = Field(default_factory=list)
@@ -178,7 +197,7 @@ class GraphRelationUpsertRequest(BaseModel):
     target_paper_id: int = Field(..., ge=1)
     relation: str = Field(..., min_length=2, max_length=32)
     score: float = Field(default=0.6, ge=0.0, le=1.0)
-    evidence: str | None = Field(default=None, max_length=240)
+    evidence: str | None = Field(default=None, max_length=800)
     previous_relation: str | None = Field(default=None, min_length=2, max_length=32)
 
 class GraphRelationMutationResponse(BaseAPIResponse):

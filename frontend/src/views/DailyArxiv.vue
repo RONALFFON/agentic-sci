@@ -284,7 +284,7 @@ const saveOne = async (paper: Paper) => {
     if ((res.llm_classified ?? 0) > 0) parts.push(`LLM 归类 ${res.llm_classified} 条`)
     if ((res.pdf_downloaded ?? 0) > 0) parts.push(`本地 PDF ${res.pdf_downloaded} 个`)
     message.success(parts.join('，'))
-    if (res.message) message.warning(res.message)
+    if (res.processing_queued) message.info('后台正在处理论文，可在文献库查看进度。')
     const identityKey = paper.arxiv_id
       ? `arxiv:${paper.arxiv_id}`
       : paper.doi

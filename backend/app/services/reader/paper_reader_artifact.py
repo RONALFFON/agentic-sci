@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import sqlite3
 from uuid import uuid4
 from ..llm.agent_runtime import check_active
 from ..task_state import task_lock, identity
@@ -98,9 +99,21 @@ def build_reader_artifact(
         if _pdf_stat(pdf_abspath) != original_pdf:
             os.remove(tmp)
             return None
-        os.replace(tmp, path)
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            has_tombstones = conn.execute("SELECT 1 FROM sqlite_master WHERE name='deleted_papers'").fetchone()
+            if has_tombstones and conn.execute('SELECT 1 FROM deleted_papers WHERE paper_id=?', (paper_id,)).fetchone():
+                os.remove(tmp)
+                return None
+            os.replace(tmp, path)
     except Exception:
         return None
+    finally:
+        if 'tmp' in locals() and os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return artifact
 
 

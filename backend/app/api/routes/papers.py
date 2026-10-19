@@ -241,6 +241,29 @@ def get_library(
     )
 
 # ── 论文保存 ──
+from ...models.schemas import PaperProcessingResponse
+
+
+@router.get('/processing/status', response_model=PaperProcessingResponse)
+def paper_processing_status(ids: str = Query(..., max_length=2000), db=Depends(get_database)):
+    from ...services.papers.processing_jobs import list_jobs
+    try:
+        paper_ids = sorted({int(value) for value in ids.split(',') if value.strip()})
+    except ValueError:
+        raise HTTPException(status_code=422, detail='论文 ID 必须为整数')
+    if len(paper_ids) > 100 or any(pid <= 0 for pid in paper_ids):
+        raise HTTPException(status_code=422, detail='每次最多查询 100 个有效论文 ID')
+    return PaperProcessingResponse(success=True, jobs=list_jobs(db.db_path, paper_ids))
+
+
+@router.post('/processing/{paper_id}/retry')
+def retry_paper_processing(paper_id: int, db=Depends(get_database)):
+    from ...services.papers.processing_jobs import retry_job
+    if not retry_job(db.db_path, paper_id):
+        raise HTTPException(status_code=409, detail='仅可重试处理失败且仍在库中的论文')
+    return {'success': True}
+
+
 @router.post("/save", response_model=SavePapersResponse)
 async def save_papers(
     request: SavePapersRequest,

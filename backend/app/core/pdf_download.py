@@ -6,6 +6,8 @@ import contextlib
 import logging
 import os
 import re
+import time
+from uuid import uuid4
 from urllib.parse import urlparse
 
 import requests
@@ -125,6 +127,8 @@ def _should_probe_html_for_pdf(url: str) -> bool:
     return not re.search(r"openalex\.org/(?:w\d+|works/)", u)
 
 def resolve_paper_pdf_url(paper: Paper, email: str = "") -> str | None:
+    from ..services.llm.agent_runtime import check_active, remaining_seconds
+    check_active()
     u = (getattr(paper, "pdf_url", None) or "").strip()
     su = (getattr(paper, "source_url", None) or "").strip()
     doi_u = _normalize_doi_url(getattr(paper, "doi", None) or "")
@@ -157,7 +161,8 @@ def resolve_paper_pdf_url(paper: Paper, email: str = "") -> str | None:
 
     for cand_url in probe_candidates:
         try:
-            got = fetch_pdf_url_from_html_page(cand_url, email=email)
+            check_active()
+            got = fetch_pdf_url_from_html_page(cand_url, email=email, timeout=min(10, remaining_seconds()))
             if got:
                 return got
         except Exception:
@@ -173,7 +178,7 @@ def resolve_paper_pdf_url(paper: Paper, email: str = "") -> str | None:
             mail = (email or "").strip()
             ua = f"PaperGraph/0.3 (mailto:{mail})" if mail else "PaperGraph/0.3"
             headers = {"User-Agent": ua, "Accept": "application/pdf"}
-            with requests.get(doi_u, timeout=30, headers=headers, allow_redirects=True, stream=True) as r:
+            with requests.get(doi_u, timeout=min(10, remaining_seconds()), headers=headers, allow_redirects=True, stream=True) as r:
                 if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
                     return doi_u
         except Exception:
@@ -186,42 +191,57 @@ def _cleanup_temp_file(tmp_path: str) -> None:
         if os.path.isfile(tmp_path):
             os.remove(tmp_path)
 
-def download_paper_pdf_to_path(paper: Paper, dest_abspath: str, email: str = "") -> bool:
-    try:
-        urls = _pdf_download_candidates(paper, email=email)
-        if not urls:
-            return False
+def download_paper_pdf_to_path(paper: Paper, dest_abspath: str, email: str = "", *,
+                               max_bytes: int = 100 * 1024 * 1024, timeout_sec: float = 120) -> bool:
+    from ..services.task_state import identity, task_lock
+    from ..services.llm.agent_runtime import check_active, remaining_seconds, execution_scope
 
-        with contextlib.suppress(OSError):
+    deadline = time.monotonic() + min(timeout_sec, remaining_seconds(timeout_sec))
+    with execution_scope(timeout_sec), task_lock(identity("pdf-download", os.path.abspath(dest_abspath))):
+        tmp = dest_abspath + "." + uuid4().hex + ".part"
+        try:
+            urls = _pdf_download_candidates(paper, email=email)
             os.makedirs(os.path.dirname(dest_abspath) or ".", exist_ok=True)
-
-        for url in urls:
-            tmp = dest_abspath + ".part"
-            try:
-                headers = _headers_for_pdf_get(url, paper, email)
-                with requests.get(url, timeout=90, stream=True, headers=headers, allow_redirects=True) as r:
-                    if r.status_code != 200:
-                        continue
-
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            if chunk:
+            for url in urls:
+                check_active()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    with requests.get(url, timeout=(min(10, remaining), min(10, remaining)), stream=True,
+                                      headers=_headers_for_pdf_get(url, paper, email), allow_redirects=True) as r:
+                        if r.status_code != 200:
+                            continue
+                        length = r.headers.get("Content-Length")
+                        if length and int(length) > max_bytes:
+                            continue
+                        size = 0
+                        prefix = b""
+                        with open(tmp, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                check_active()
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError("PDF 下载超过总耗时限制")
+                                if not chunk:
+                                    continue
+                                size += len(chunk)
+                                if size > max_bytes:
+                                    raise ValueError("PDF 超过大小限制")
+                                if len(prefix) < 5:
+                                    prefix = (prefix + chunk)[:5]
+                                    if len(prefix) == 5 and prefix != b"%PDF-":
+                                        raise ValueError("下载内容不是 PDF")
                                 f.write(chunk)
-
-                if os.path.getsize(tmp) < 256 or not _file_looks_like_pdf(tmp):
+                        if size >= 256 and _file_looks_like_pdf(tmp):
+                            os.replace(tmp, dest_abspath)
+                            return True
+                except (OSError, ValueError, requests.RequestException):
+                    _log.debug("PDF 候选下载失败", exc_info=True)
+                finally:
                     _cleanup_temp_file(tmp)
-                    continue
-
-                os.replace(tmp, dest_abspath)
-                return True
-
-            except (OSError, requests.RequestException):
-                _cleanup_temp_file(tmp)
-                continue
-
-        return False
-
-    except Exception as ex:
-        _log.warning("download_paper_pdf_to_path 异常: %s", ex, exc_info=True)
-        _cleanup_temp_file(dest_abspath + ".part")
-        return False
+            return False
+        except Exception as ex:
+            _log.warning("download_paper_pdf_to_path 异常: %s", ex)
+            return False
+        finally:
+            _cleanup_temp_file(tmp)

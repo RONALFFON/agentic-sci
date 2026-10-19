@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { ref, onScopeDispose, type Ref } from 'vue'
 interface SearchConversation<TMessage> {
   id: string
   title: string
@@ -11,6 +11,7 @@ interface UseSearchConversationsOptions<TMessage> {
   hasSearched: Ref<boolean>
   userInput: Ref<string>
   titleFromMessages: (messages: TMessage[]) => string
+  onStorageError?: (message: string) => void
   stateStorageKey?: string
   conversationsStorageKey?: string
 }
@@ -19,12 +20,25 @@ export function useSearchConversations<TMessage>({
   hasSearched,
   userInput,
   titleFromMessages,
+  onStorageError,
   stateStorageKey = 'searchAgentState',
   conversationsStorageKey = 'searchAgentConversations',
 }: UseSearchConversationsOptions<TMessage>) {
   const conversations = ref<SearchConversation<TMessage>[]>([])
   const currentConversationId = ref<string | null>(null)
   const PERSIST_DEBOUNCE_MS = 900
+  const MAX_HISTORY_BYTES = 2 * 1024 * 1024
+  const MAX_STATE_BYTES = 1024 * 1024
+  const MAX_CONVERSATIONS = 50
+  let warned = false
+  function storageWarning(text: string) {
+    if (!warned) { warned = true; onStorageError?.(text) }
+  }
+  function writeBounded(key: string, value: unknown, maxBytes: number) {
+    const encoded = JSON.stringify(value)
+    if (new Blob([encoded]).size > maxBytes) throw new Error('会话内容超过本地保存容量')
+    localStorage.setItem(key, encoded)
+  }
   let conversationsPersistTimer: ReturnType<typeof setTimeout> | null = null
   let statePersistTimer: ReturnType<typeof setTimeout> | null = null
   function generateId(): string {
@@ -36,9 +50,10 @@ export function useSearchConversations<TMessage>({
       conversationsPersistTimer = null
     }
     try {
-      localStorage.setItem(conversationsStorageKey, JSON.stringify(conversations.value))
+      writeBounded(conversationsStorageKey, conversations.value, MAX_HISTORY_BYTES)
     } catch (e) {
       console.error('Failed to save conversations:', e)
+      storageWarning('会话历史未能保存，请删除不需要的历史记录后重试；当前页面内容仍然保留。')
     }
   }
   function saveConversations(immediate = false) {
@@ -52,7 +67,11 @@ export function useSearchConversations<TMessage>({
   function loadConversations() {
     try {
       const saved = localStorage.getItem(conversationsStorageKey)
-      if (saved) conversations.value = JSON.parse(saved)
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        if (!Array.isArray(parsed)) throw new Error('历史记录格式无效')
+        conversations.value = parsed.filter(c => c && typeof c.id === 'string' && Array.isArray(c.messages))
+      }
     } catch (e) {
       console.error('Failed to load conversations:', e)
       conversations.value = []
@@ -64,16 +83,18 @@ export function useSearchConversations<TMessage>({
       statePersistTimer = null
     }
     try {
-      localStorage.setItem(
+      writeBounded(
         stateStorageKey,
-        JSON.stringify({
+        {
           messages: messages.value,
           hasSearched: hasSearched.value,
           currentConversationId: currentConversationId.value,
           timestamp: Date.now(),
-        })
+        }, MAX_STATE_BYTES
       )
     } catch {
+      try { localStorage.removeItem(stateStorageKey) } catch { /* 存储不可用 */ }
+      storageWarning('当前会话未能保存，刷新页面可能丢失进度。')
     }
   }
   function saveState(immediate = false) {
@@ -94,10 +115,16 @@ export function useSearchConversations<TMessage>({
         currentConversationId?: string | null
         timestamp?: number
       }
-      if (!state.timestamp || Date.now() - state.timestamp >= 24 * 60 * 60 * 1000) return
-      clearState()
+      if (!state.timestamp || Date.now() - state.timestamp >= 24 * 60 * 60 * 1000 || !Array.isArray(state.messages)) {
+        clearState()
+        return
+      }
+      messages.value = state.messages
+      hasSearched.value = !!state.hasSearched
+      currentConversationId.value = typeof state.currentConversationId === 'string' ? state.currentConversationId : null
     } catch (e) {
       console.error('Failed to load search state:', e)
+      clearState()
     }
   }
   function clearState() {
@@ -105,7 +132,7 @@ export function useSearchConversations<TMessage>({
       clearTimeout(statePersistTimer)
       statePersistTimer = null
     }
-    localStorage.removeItem(stateStorageKey)
+    try { localStorage.removeItem(stateStorageKey) } catch { /* 存储不可用 */ }
   }
   function saveCurrentConversation() {
     if (!hasSearched.value || messages.value.length === 0) return
@@ -120,7 +147,13 @@ export function useSearchConversations<TMessage>({
     }
     const existingIndex = conversations.value.findIndex((c) => c.id === convId)
     if (existingIndex >= 0) conversations.value.splice(existingIndex, 1, next)
-    else conversations.value.unshift(next)
+    else {
+      if (conversations.value.length >= MAX_CONVERSATIONS) {
+        storageWarning('历史记录已达到 50 条，请删除旧记录后再保存新会话；当前会话仍会单独保存。')
+        return
+      }
+      conversations.value.unshift(next)
+    }
     saveConversations()
   }
   function ensureCurrentConversationId(): string {
@@ -131,7 +164,7 @@ export function useSearchConversations<TMessage>({
     const conversation = conversations.value.find((c) => c.id === id)
     if (!conversation) return
     saveCurrentConversation()
-    messages.value = [...conversation.messages]
+    messages.value = JSON.parse(JSON.stringify(conversation.messages))
     hasSearched.value = true
     currentConversationId.value = id
     saveState()
@@ -172,6 +205,15 @@ export function useSearchConversations<TMessage>({
     }
     return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
   }
+  function flushPending() {
+    if (conversationsPersistTimer) flushConversationsPersist()
+    if (statePersistTimer) flushStatePersist()
+  }
+  if (typeof window !== 'undefined') window.addEventListener('pagehide', flushPending)
+  onScopeDispose(() => {
+    flushPending()
+    if (typeof window !== 'undefined') window.removeEventListener('pagehide', flushPending)
+  })
   return {
     conversations,
     currentConversationId,

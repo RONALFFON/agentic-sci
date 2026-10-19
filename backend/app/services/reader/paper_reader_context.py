@@ -240,6 +240,8 @@ def _ensure_cache_table(conn: sqlite3.Connection) -> None:
         cur.execute("ALTER TABLE paper_pdf_excerpt_cache ADD COLUMN last_hit_at INTEGER")
     if "last_miss_at" not in cols:
         cur.execute("ALTER TABLE paper_pdf_excerpt_cache ADD COLUMN last_miss_at INTEGER")
+    from ..papers.file_cleanup import guard_deleted_papers
+    guard_deleted_papers(conn, 'paper_pdf_excerpt_cache')
     conn.commit()
 
 def _pdf_stat(abspath: str) -> tuple[int, int | None]:

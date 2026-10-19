@@ -118,6 +118,8 @@ class MemoryStore:
                 conn.execute("ALTER TABLE paper_memory ADD COLUMN embed_model TEXT")
             if "embed_dim" not in cols:
                 conn.execute("ALTER TABLE paper_memory ADD COLUMN embed_dim INTEGER")
+            from ..papers.file_cleanup import guard_deleted_papers
+            guard_deleted_papers(conn, 'paper_memory')
             check_active()
             conn.commit()
         finally:
@@ -165,6 +167,8 @@ class MemoryStore:
             )
             check_active()
             conn.commit()
+            if cur.rowcount == 0:
+                return None
             row_id = int(cur.lastrowid)
         finally:
             conn.close()

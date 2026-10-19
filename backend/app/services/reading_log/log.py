@@ -12,6 +12,10 @@ def ensure_tables(db_path: str) -> None:
           day_key TEXT NOT NULL, created_at INTEGER NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS idx_prs_day ON paper_reading_sessions(day_key, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_prs_paper ON paper_reading_sessions(paper_id, created_at)")
+    from ..papers.file_cleanup import guard_deleted_papers
+    with sqlite3.connect(db_path) as conn:
+        guard_deleted_papers(conn, 'paper_reading_sessions')
+
 
 def append_session(db_path: str, *, paper_id: int, duration_sec: int, client_ts: int | None = None) -> None:
     if not db_path or int(duration_sec or 0) <= 0:

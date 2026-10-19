@@ -56,10 +56,15 @@ async def lifespan(app: FastAPI):
 
     logger.info("%s", "=" * 60)
 
+    from .dependencies import get_database
+    from ..services.papers.processing_jobs import PaperProcessingWorker
+    paper_worker = PaperProcessingWorker(get_database())
+    paper_worker.start()
     yield
 
     logger.info("%s", "=" * 60)
     logger.info("👋 应用正在关闭...")
+    await asyncio.to_thread(paper_worker.stop)
     from ..services.llm.agent_runtime import shutdown_agent_runtime
     if daily_refresh_task is not None:
         daily_refresh_task.cancel()

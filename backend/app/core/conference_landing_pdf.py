@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -61,6 +62,10 @@ def fetch_pdf_url_from_html_page(
     timeout: int = 35,
     max_bytes: int = 800_000,
 ) -> str | None:
+    from ..services.llm.agent_runtime import check_active, remaining_seconds
+    check_active()
+    timeout = min(timeout, remaining_seconds(timeout))
+    deadline = time.monotonic() + timeout
     u0 = (url or "").strip()
     if not u0.lower().startswith(("http://", "https://")):
         return None
@@ -75,8 +80,11 @@ def fetch_pdf_url_from_html_page(
                 return None
             buf = bytearray()
             for chunk in r.iter_content(65536):
+                check_active()
+                if time.monotonic() >= deadline:
+                    return None
                 if chunk:
-                    buf.extend(chunk)
+                    buf.extend(chunk[:max_bytes - len(buf)])
                     if len(buf) >= max_bytes:
                         break
         text = bytes(buf).decode("utf-8", errors="ignore")

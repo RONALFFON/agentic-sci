@@ -14,6 +14,9 @@ def ensure_tables(db_path: str) -> None:
         "CREATE TABLE IF NOT EXISTS paper_reader_turns(id INTEGER PRIMARY KEY AUTOINCREMENT,paper_id INTEGER NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,created_at INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_paper_reader_turns_paper ON paper_reader_turns(paper_id,created_at)",
     )
+    from ..papers.file_cleanup import guard_deleted_papers
+    with sqlite3.connect(db_path) as conn:
+        guard_deleted_papers(conn, 'paper_reader_turns')
 
 @contextmanager
 def _conn(db_path: str, *, row_factory=None):

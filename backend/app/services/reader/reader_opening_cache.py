@@ -26,6 +26,8 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_opening_cache)")}
     if "content_version" not in columns:
         conn.execute("ALTER TABLE paper_opening_cache ADD COLUMN content_version TEXT")
+    from ..papers.file_cleanup import guard_deleted_papers
+    guard_deleted_papers(conn, 'paper_opening_cache')
 
 
 def get_cached_opening(db_path: str, paper_id: int, max_age_hours: int = 72, content_version: str | None = None) -> tuple[str | None, bool]:

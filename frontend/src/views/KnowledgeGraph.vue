@@ -80,10 +80,7 @@
             <div v-if="selectedEdge.weight != null" class="kg-info__kv">
               <strong>weight</strong>：{{ selectedEdge.weight }}
             </div>
-            <div v-if="selectedEdge.evidence" class="kg-info__kv">
-              <strong>构建理由</strong>：
-              <div class="kg-evidence">{{ selectedEdge.evidence }}</div>
-            </div>
+            <GraphEvidence :evidence="selectedEdge.evidence" :details="selectedEdge.evidence_details" />
             <div class="kg-info__kv"><strong>source</strong>：{{ selectedEdge.source }}</div>
             <div class="kg-info__kv"><strong>target</strong>：{{ selectedEdge.target }}</div>
             <a-button
@@ -117,7 +114,7 @@
               <a-textarea
                 v-model:value="edgeEdit.evidence"
                 :rows="3"
-                :maxlength="240"
+                :maxlength="800"
                 show-count
                 placeholder="关系证据（可选）"
                 style="margin-top: 6px"
@@ -161,6 +158,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import * as d3 from 'd3'
+import GraphEvidence from '@/components/graph/GraphEvidence.vue'
+import type { components } from '@/types/openapi'
 import apiClient, { getPaper } from '@/services/api'
 type GraphNode = {
   id: string
@@ -171,7 +170,7 @@ type GraphNode = {
   category?: string | null
   weight?: number
 }
-type GraphEdge = { source: string; target: string; type: string; weight?: number; evidence?: string }
+type GraphEdge = { source: string; target: string; type: string; weight?: number; evidence?: string; evidence_details?: components['schemas']['GraphEvidence'] | null }
 type SelectedEdge = GraphEdge & {
   sourceLabel: string
   targetLabel: string
@@ -465,6 +464,7 @@ function render() {
       type: e.type,
       weight: e.weight ?? 1,
       evidence: e.evidence ?? '',
+      evidence_details: e.evidence_details,
     }))
     .filter((l) => typeof l.source !== 'string' && typeof l.target !== 'string') as any[]
   const sim = d3
@@ -492,6 +492,7 @@ function render() {
         type: String(d.type || ''),
         weight: Number(d.weight ?? 1),
         evidence: String(d.evidence || '').trim() || undefined,
+        evidence_details: d.evidence_details,
         sourceLabel: String(s.label || s.id || ''),
         targetLabel: String(t.label || t.id || ''),
         sourcePaperId: s.type === 'paper' ? (s.paper_id ?? null) : null,

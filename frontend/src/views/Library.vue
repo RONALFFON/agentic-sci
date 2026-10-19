@@ -93,6 +93,9 @@
                 </span>
                 <a-tag v-else>{{ record.source }}</a-tag>
               </template>
+              <template v-if="column.key === 'processing'">
+                <PaperProcessingStatus :job="processingJobs[record.id]" @retry="onRetryProcessing" />
+              </template>
               <template v-if="column.key === 'actions'">
                 <span class="lib-cell-actions" @click.stop>
                   <a-button type="link" size="small" @click="goReader(record)">阅读</a-button>
@@ -111,6 +114,9 @@ import { ref, onMounted, computed, watch, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
 import { getLibrary, getLibraryCategoryFolders, deletePaper } from '@/services/api'
+import PaperProcessingStatus from '@/components/library/PaperProcessingStatus.vue'
+import { usePaperProcessing } from '@/composables/usePaperProcessing'
+import { useRequestScope } from '@/composables/useRequestScope'
 import type { LibraryCategoryFolder, Paper } from '@/types'
 const router = useRouter()
 const papers = ref<Paper[]>([])
@@ -145,6 +151,7 @@ const columns = [
   { title: '年份', key: 'year', width: '7%', align: 'center' as const },
   { title: '出版', key: 'journal_or_source', width: '14%', align: 'center' as const },
   { title: '领域', key: 'category', width: '24%', align: 'left' as const, ellipsis: true },
+  { title: '处理进度', key: 'processing', width: 140 },
   { title: '操作', key: 'actions', width: '10%', align: 'center' as const },
 ]
 function formatAuthorsEtAl(authors: Paper['authors'] | undefined): string {
@@ -166,10 +173,9 @@ const loadFolders = async () => {
   } catch {
   }
 }
-let _loading = false
+const requests = useRequestScope(() => `${selectedKey.value}:${searchQuery.value}:${pagination.value.current}:${pagination.value.pageSize}`)
 const load = async () => {
-  if (_loading) return
-  _loading = true
+  const scope = requests.begin()
   loading.value = true
   try {
     const sk = selectedKey.value
@@ -182,17 +188,24 @@ const load = async () => {
       offset,
       ...(cat ? { category: cat } : {}),
       ...(q ? { q } : {}),
-    })
+    }, scope.controller.signal)
+    if (!requests.isCurrent(scope)) return
     if (res.success) {
       papers.value = res.papers ?? []
       pagination.value = { ...pagination.value, total: typeof res.total === 'number' ? res.total : papers.value.length }
     }
   } catch (e: unknown) {
-    message.error((e as Error).message || '加载失败')
+    if (requests.isCurrent(scope)) message.error((e as Error).message || '加载失败')
   } finally {
-    loading.value = false
-    _loading = false
+    if (requests.isCurrent(scope)) loading.value = false
   }
+}
+const { jobs: processingJobs, retry: retryProcessing } = usePaperProcessing(papers, () => {
+  void load()
+  void loadFolders()
+})
+async function onRetryProcessing(id: number) {
+  try { await retryProcessing(id) } catch (e) { message.error((e as Error).message || '重试失败') }
 }
 const onTableChange = (pag: { current?: number; pageSize?: number }) => {
   if (pag.current != null) pagination.value.current = pag.current

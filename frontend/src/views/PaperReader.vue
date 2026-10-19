@@ -139,6 +139,7 @@ import {
 } from '@/services/api'
 import type { Paper } from '@/types'
 import PdfJsViewer from '@/components/PdfJsViewer.vue'
+import { useRequestScope } from '@/composables/useRequestScope'
 import { renderMarkdown } from '@/utils/markdown'
 const route = useRoute()
 const router = useRouter()
@@ -180,6 +181,7 @@ const paperId = computed(() => {
   const n = typeof raw === 'string' ? parseInt(raw, 10) : Array.isArray(raw) ? parseInt(raw[0], 10) : NaN
   return Number.isFinite(n) && n > 0 ? n : null
 })
+const requests = useRequestScope(() => paperId.value)
 const isStandalone = computed(() => String(route.query?.standalone || '') === '1')
 const hasLocalPdfForViewer = computed(
   () => !!(paper.value?.local_pdf_path && String(paper.value.local_pdf_path).trim())
@@ -318,13 +320,16 @@ const mapHistoryTurns = (
       return { role, content }
     })
 const ensureOpeningAndHistory = async (reloadHistory = false, showError = true) => {
-  if (paperId.value == null) return
+  const scope = requests.capture()
+  if (!scope || scope.key == null || !requests.isCurrent(scope)) return
   try {
-    const res = await postPaperReaderOpening(paperId.value)
+    const res = await postPaperReaderOpening(scope.key, scope.controller.signal)
+    if (!requests.isCurrent(scope)) return
     if (!res.success || !res.opening) return
     if (res.pdf_parsing) pdfParsing.value = true
     if (reloadHistory) {
-      const h = await getPaperReaderHistory(paperId.value, 200)
+      const h = await getPaperReaderHistory(scope.key, 200, scope.controller.signal)
+      if (!requests.isCurrent(scope)) return
       if (h?.success && Array.isArray(h.turns) && h.turns.length > 0) {
         const restored = mapHistoryTurns(h.turns)
         if (restored.length > 0) {
@@ -340,7 +345,7 @@ const ensureOpeningAndHistory = async (reloadHistory = false, showError = true) 
       await scrollBottom()
     }
   } catch (e: unknown) {
-    if (showError) {
+    if (requests.isCurrent(scope) && showError) {
       message.error((e as Error).message || '导读加载失败')
     }
   }
@@ -353,9 +358,12 @@ const maybeStartOpening = async (reloadHistory = false, showError = true) => {
   void ensureOpeningAndHistory(reloadHistory, showError)
 }
 const send = async () => {
+  const scope = requests.capture()
+  if (!scope || scope.key == null || !requests.isCurrent(scope)) return
   const text = draft.value.trim()
   if (!text || paperId.value == null || sending.value) return
   if (composing.value) return
+  const history = messages.value.map(({ role, content }) => ({ role, content }))
   sending.value = true
   messages.value.push({ role: 'user', content: text })
   draft.value = ''
@@ -363,11 +371,13 @@ const send = async () => {
   await nextTick()
   await scrollBottom()
   try {
+    if (!requests.isCurrent(scope)) return
     const res = await postPaperReaderChat({
-      paper_id: paperId.value,
-      messages: messages.value.slice(0, -1),
+      paper_id: scope.key,
+      messages: history,
       user_message: text,
-    })
+    }, scope.controller.signal)
+    if (!requests.isCurrent(scope)) return
     if (res.success && res.reply) {
       const rp = Array.isArray((res as any).related_papers) ? ((res as any).related_papers as Paper[]) : []
       messages.value.push({
@@ -379,11 +389,14 @@ const send = async () => {
       messages.value.push({ role: 'assistant', content: '（无回复）' })
     }
   } catch (e: unknown) {
+    if (!requests.isCurrent(scope)) return
     message.error((e as Error).message || '发送失败')
     messages.value.push({ role: 'assistant', content: '请求失败，请检查网络或 LLM 配置。' })
   } finally {
-    sending.value = false
-    await scrollBottom()
+    if (requests.isCurrent(scope)) {
+      sending.value = false
+      await scrollBottom()
+    }
   }
 }
 const paperExternalUrl = (p: Paper): string | null => {
@@ -425,7 +438,11 @@ const saveRelatedPaperToLibrary = async (p: Paper) => {
   }
 }
 const loadPaper = async () => {
-  await flushReadingSession()
+  const scope = requests.begin()
+  void flushReadingSession()
+  sending.value = false
+  pdfParsing.value = false
+  draft.value = ''
   loadingPaper.value = true
   loadError.value = ''
   paper.value = null
@@ -433,17 +450,21 @@ const loadPaper = async () => {
   openingStarted.value = false
   messages.value = []
   await nextTick()
+  if (!requests.isCurrent(scope)) return
   initDefaultSplitIfNeeded()
-  if (paperId.value == null) {
+  if (scope.key == null) {
     loadError.value = '无效的文献 ID'
     loadingPaper.value = false
     return
   }
-  readingSession.value = { paperId: paperId.value, startedAtMs: Date.now() }
+  readingSession.value = { paperId: scope.key, startedAtMs: Date.now() }
   try {
-    paper.value = await getPaper(paperId.value)
+    const loaded = await getPaper(scope.key, scope.controller.signal)
+    if (!requests.isCurrent(scope)) return
+    paper.value = loaded
     try {
-      const h = await getPaperReaderHistory(paperId.value, 200)
+      const h = await getPaperReaderHistory(scope.key, 200, scope.controller.signal)
+      if (!requests.isCurrent(scope)) return
       if (h?.success && Array.isArray(h.turns) && h.turns.length > 0) {
         const restored = mapHistoryTurns(h.turns)
         if (restored.length > 0) {
@@ -453,15 +474,17 @@ const loadPaper = async () => {
       }
     } catch {
     }
+    if (!requests.isCurrent(scope)) return
     if (messages.value.length === 0) {
       void maybeStartOpening()
     } else if (messages.value[0]?.role === 'user') {
       void maybeStartOpening(true, false)
     }
   } catch (e: unknown) {
+    if (!requests.isCurrent(scope)) return
     loadError.value = (e as Error).message || '加载失败'
   } finally {
-    loadingPaper.value = false
+    if (requests.isCurrent(scope)) loadingPaper.value = false
   }
 }
 watch(

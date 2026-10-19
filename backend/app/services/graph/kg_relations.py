@@ -281,6 +281,7 @@ def upsert_relations(db_path: str, source_paper_id: int, edges: list[dict[str, A
     n = 0
     allowed = {"improves", "extends", "uses", "compares", "surveys", "references", "dataset_overlap", "method_overlap", "task_overlap"}
     with sqlite3.connect(db_path) as conn:
+        conn.execute('BEGIN IMMEDIATE')
         for edge in edges:
             try:
                 if type(edge.get("target_paper_id")) is not int:
@@ -300,6 +301,9 @@ def upsert_relations(db_path: str, source_paper_id: int, edges: list[dict[str, A
                 "kind": ("text_anchored_model_inference" if edge.get("evidence_quote") else "model_inference") if validated_model else "user_edited",
             }, ensure_ascii=False)
             check_active()
+            if conn.execute('SELECT COUNT(*) FROM papers WHERE id IN (?,?)',
+                            (int(source_paper_id), target)).fetchone()[0] != 2:
+                continue
             conn.execute("""INSERT INTO paper_relations
                 (source_paper_id,target_paper_id,relation,score,evidence,created_at,updated_at,evidence_json)
                 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source_paper_id,target_paper_id,relation) DO UPDATE SET

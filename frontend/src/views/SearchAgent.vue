@@ -233,7 +233,7 @@ const {
   messages,
   hasSearched,
   userInput,
-  showSidebar,
+  onStorageError: (text) => message.warning(text),
   titleFromMessages: generateTitle,
 })
 function deleteConversation(id: string) {
@@ -307,7 +307,7 @@ const { sendMessage } = useSearchAgentChat({
 const saveOne = async (paper: Paper) => {
   try {
     const res = await savePapers([paper])
-    message.success(`已新增 ${res.added} 条到文献库`)
+    res.success ? message.success(res.message || `已新增 ${res.added} 条到文献库`) : message.warning('部分论文保存失败，请重试失败条目。')
   } catch (e: unknown) {
     message.error((e as Error).message || '保存失败')
   }
@@ -316,7 +316,7 @@ const saveAllFromMessage = async (msg: Message) => {
   if (!msg.results || msg.results.length === 0) return
   try {
     const res = await savePapers(msg.results, { llm_classify: false })
-    message.success(`已新增 ${res.added} 条到文献库`)
+    res.success ? message.success(res.message || `已新增 ${res.added} 条到文献库`) : message.warning('部分论文保存失败，请重试失败条目。')
   } catch (e: unknown) {
     message.error((e as Error).message || '保存失败')
   }

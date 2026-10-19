@@ -11,13 +11,13 @@ class RelationRepository:
     def fetch_relation_rows(
         self, *, focus_id: int | None, paper_ids: set[int | None], limit: int,
         relation_types: set[str] | None = None, min_score: float = 0.0,
-    ) -> list[tuple[int, int, str, float, str]]:
+    ) -> list[tuple[int, int, str, float, str, str]]:
         import sqlite3
         if int(limit) <= 0:
             return []
         if relation_types is not None and not relation_types:
             return []
-        rows: list[tuple[int, int, str, float, str]] = []
+        rows: list[tuple[int, int, str, float, str, str]] = []
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             relation_sql = ""
@@ -30,7 +30,7 @@ class RelationRepository:
             score_params: list[object] = [float(min_score)] if float(min_score) > 0 else []
             if focus_id is not None:
                 cur.execute(
-                    """SELECT source_paper_id, target_paper_id, relation, score, evidence
+                    """SELECT source_paper_id, target_paper_id, relation, score, evidence, evidence_json
                     FROM paper_relations
                     WHERE (source_paper_id = ? OR target_paper_id = ?)"""
                     + relation_sql + score_sql
@@ -45,7 +45,7 @@ class RelationRepository:
                 cur.execute("DELETE FROM _kg_pid")
                 cur.executemany("INSERT OR IGNORE INTO _kg_pid(id) VALUES (?)", [(i,) for i in ids])
                 cur.execute(
-                    """SELECT pr.source_paper_id, pr.target_paper_id, pr.relation, pr.score, pr.evidence
+                    """SELECT pr.source_paper_id, pr.target_paper_id, pr.relation, pr.score, pr.evidence, pr.evidence_json
                     FROM paper_relations pr
                     INNER JOIN _kg_pid a ON a.id = pr.source_paper_id
                     INNER JOIN _kg_pid b ON b.id = pr.target_paper_id
@@ -55,8 +55,8 @@ class RelationRepository:
                     + " ORDER BY pr.score DESC, pr.updated_at DESC LIMIT ?",
                     (*relation_params, *score_params, int(limit)),
                 )
-            for sid, tid, rel, score, evidence in cur.fetchall():
-                rows.append((int(sid), int(tid), str(rel or ""), float(score or 0.0), str(evidence or "")))
+            for sid, tid, rel, score, evidence, provenance in cur.fetchall():
+                rows.append((int(sid), int(tid), str(rel or ""), float(score or 0.0), str(evidence or ""), str(provenance or "")))
         return rows
 
     def relation_exists(self, *, source_paper_id: int, target_paper_id: int, relation: str) -> bool:
